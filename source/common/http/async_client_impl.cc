@@ -19,7 +19,9 @@ AsyncClientImpl::AsyncClientImpl(const Upstream::ClusterInfo& cluster, Stats::St
                                  random, std::move(shadow_writer), true),
       dispatcher_(dispatcher), local_address_(local_address) {}
 
-AsyncClientImpl::~AsyncClientImpl() { ASSERT(active_requests_.empty()); }
+AsyncClientImpl::~AsyncClientImpl() {
+  ASSERT(active_requests_.empty()); // FIXFIX: Need to handle destruction with active.
+}
 
 AsyncClient::Request* AsyncClientImpl::send(MessagePtr&& request, AsyncClient::Callbacks& callbacks,
                                             const Optional<std::chrono::milliseconds>& timeout) {

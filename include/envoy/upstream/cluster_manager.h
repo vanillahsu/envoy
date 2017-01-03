@@ -2,6 +2,7 @@
 
 #include "envoy/http/async_client.h"
 #include "envoy/http/conn_pool.h"
+#include "envoy/json/json_object.h"
 #include "envoy/upstream/upstream.h"
 
 namespace Upstream {
@@ -15,15 +16,27 @@ public:
   virtual ~ClusterManager() {}
 
   /**
+   * Add or update a cluster via API. The semantics of this API are:
+   * 1) The hash of the config is used to determine if an already existing cluser has changed.
+   *    Nothing is done if the hash matches the previously running configuration.
+   * 2) Statically defined clusters (those present when Envoy starts) can not be updated via API.
+   *
+   * @return true if the action results in an add/update of a cluster.
+   */
+  virtual bool addOrUpdatePrimaryCluster(const Json::Object& config) PURE;
+
+  /**
    * Set a callback that will be invoked when all owned clusters have been initialized.
    */
   virtual void setInitializedCb(std::function<void()> callback) PURE;
 
+  typedef std::unordered_map<std::string, std::reference_wrapper<const Cluster>> ClusterInfoMap;
+
   /**
-   * @return std::unordered_map<std::string, ConstClusterPtr> all current clusters. These are are
-   * the primary (not thread local) clusters so should just be used for stats/admin.
+   * @return ClusterInfoMap all current clusters. These are are the primary (not thread local)
+   * clusters so should just be used for stats/admin.
    */
-  virtual std::unordered_map<std::string, ConstClusterPtr> clusters() PURE;
+  virtual ClusterInfoMap clusters() PURE;
 
   /**
    * @return ClusterInfoPtr the cluster info with the given name or nullptr if it does not
@@ -59,7 +72,16 @@ public:
   virtual Http::AsyncClient& httpAsyncClientForCluster(const std::string& cluster) PURE;
 
   /**
-   * Shutdown the cluster prior to destroying connection pools and other thread local data.
+   * Remove a primary cluster via API. Only clusters added via addOrUpdatePrimaryCluster() can
+   * be removed in this manner. Statically defined clusters present when Envoy starts cannot be
+   * removed.
+   *
+   * @return true if the action results in the removal of a cluster.
+   */
+  virtual bool removePrimaryCluster(const std::string& cluster) PURE;
+
+  /**
+   * Shutdown the cluster manager prior to destroying connection pools and other thread local data.
    */
   virtual void shutdown() PURE;
 };
