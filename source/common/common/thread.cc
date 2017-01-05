@@ -1,7 +1,11 @@
 #include "assert.h"
 #include "thread.h"
 
+#if defined(__FreeBSD__)
+#include <pthread_np.h>
+#else
 #include <sys/syscall.h>
+#endif
 
 namespace Thread {
 
@@ -14,7 +18,13 @@ Thread::Thread(std::function<void()> thread_routine) : thread_routine_(thread_ro
   UNREFERENCED_PARAMETER(rc);
 }
 
-int32_t Thread::currentThreadId() { return syscall(SYS_gettid); }
+int32_t Thread::currentThreadId() {
+#if defined(__FreeBSD__)
+  return pthread_getthreadid_np();
+#else
+  return syscall(SYS_gettid);
+#endif
+}
 
 void Thread::join() {
   int rc = pthread_join(thread_id_, nullptr);
