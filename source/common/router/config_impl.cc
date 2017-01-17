@@ -48,17 +48,20 @@ Upstream::ResourcePriority ConfigUtility::parsePriority(const Json::Object& conf
   }
 }
 
-bool ConfigUtility::matchHeaders(const Http::HeaderMap& headers,
-                                 const std::vector<HeaderData> request_headers) {
+bool ConfigUtility::matchHeaders(const Http::HeaderMap& request_headers,
+                                 const std::vector<HeaderData> config_headers) {
   bool matches = true;
 
-  if (!request_headers.empty()) {
-    for (const HeaderData& header_data : request_headers) {
-      const Http::HeaderEntry* header = headers.get(header_data.name_);
-      if (header_data.value_ == EMPTY_STRING) {
+  if (!config_headers.empty()) {
+    for (const HeaderData& cfg_header_data : config_headers) {
+      const Http::HeaderEntry* header = request_headers.get(cfg_header_data.name_);
+      if (cfg_header_data.value_.empty()) {
         matches &= (header != nullptr);
+      } else if (!cfg_header_data.is_regex_) {
+        matches &= (header != nullptr) && (header->value() == cfg_header_data.value_.c_str());
       } else {
-        matches &= (header != nullptr) && (header->value() == header_data.value_.c_str());
+        matches &= (header != nullptr) &&
+                   std::regex_match(header->value().c_str(), cfg_header_data.regex_pattern_);
       }
       if (!matches) {
         break;
@@ -69,7 +72,7 @@ bool ConfigUtility::matchHeaders(const Http::HeaderMap& headers,
   return matches;
 }
 
-RouteEntryImplBase::RouteEntryImplBase(const VirtualHost& vhost, const Json::Object& route,
+RouteEntryImplBase::RouteEntryImplBase(const VirtualHostImpl& vhost, const Json::Object& route,
                                        Runtime::Loader& loader)
     : case_sensitive_(route.getBoolean("case_sensitive", true)),
       prefix_rewrite_(route.getString("prefix_rewrite", "")),
@@ -91,8 +94,11 @@ RouteEntryImplBase::RouteEntryImplBase(const VirtualHost& vhost, const Json::Obj
     std::vector<Json::ObjectPtr> config_headers = route.getObjectArray("headers");
     for (const Json::ObjectPtr& header_map : config_headers) {
       // allow header value to be empty, allows matching to be only based on header presence.
+      // Regex is an opt-in. Unless explicitly mentioned, we will use header values for exact string
+      // matches.
       config_headers_.emplace_back(Http::LowerCaseString(header_map->getString("name")),
-                                   header_map->getString("value", EMPTY_STRING));
+                                   header_map->getString("value", EMPTY_STRING),
+                                   header_map->getBoolean("regex", false));
     }
   }
 }
@@ -169,7 +175,25 @@ std::string RouteEntryImplBase::newPath(const Http::HeaderMap& headers) const {
                      final_path);
 }
 
-PrefixRouteEntryImpl::PrefixRouteEntryImpl(const VirtualHost& vhost, const Json::Object& route,
+const RedirectEntry* RouteEntryImplBase::redirectEntry() const {
+  // A route for a request can exclusively be a route entry or a redirect entry.
+  if (isRedirect()) {
+    return this;
+  } else {
+    return nullptr;
+  }
+}
+
+const RouteEntry* RouteEntryImplBase::routeEntry() const {
+  // A route for a request can exclusively be a route entry or a redirect entry.
+  if (isRedirect()) {
+    return nullptr;
+  } else {
+    return this;
+  }
+}
+
+PrefixRouteEntryImpl::PrefixRouteEntryImpl(const VirtualHostImpl& vhost, const Json::Object& route,
                                            Runtime::Loader& loader)
     : RouteEntryImplBase(vhost, route, loader), prefix_(route.getString("prefix")) {}
 
@@ -184,7 +208,7 @@ bool PrefixRouteEntryImpl::matches(const Http::HeaderMap& headers, uint64_t rand
          StringUtil::startsWith(headers.Path()->value().c_str(), prefix_, case_sensitive_);
 }
 
-PathRouteEntryImpl::PathRouteEntryImpl(const VirtualHost& vhost, const Json::Object& route,
+PathRouteEntryImpl::PathRouteEntryImpl(const VirtualHostImpl& vhost, const Json::Object& route,
                                        Runtime::Loader& loader)
     : RouteEntryImplBase(vhost, route, loader), path_(route.getString("path")) {}
 
@@ -211,9 +235,9 @@ bool PathRouteEntryImpl::matches(const Http::HeaderMap& headers, uint64_t random
   return false;
 }
 
-VirtualHost::VirtualHost(const Json::Object& virtual_host, Runtime::Loader& runtime,
-                         Upstream::ClusterManager& cm)
-    : name_(virtual_host.getString("name")) {
+VirtualHostImpl::VirtualHostImpl(const Json::Object& virtual_host, Runtime::Loader& runtime,
+                                 Upstream::ClusterManager& cm)
+    : name_(virtual_host.getString("name")), rate_limit_policy_(virtual_host) {
 
   std::string require_ssl = virtual_host.getString("require_ssl", "");
   if (require_ssl == "") {
@@ -257,7 +281,7 @@ VirtualHost::VirtualHost(const Json::Object& virtual_host, Runtime::Loader& runt
   }
 }
 
-bool VirtualHost::usesRuntime() const {
+bool VirtualHostImpl::usesRuntime() const {
   bool uses = false;
   for (const RouteEntryImplBasePtr& route : routes_) {
     // Currently a base runtime rule as well as a shadow rule can use runtime.
@@ -267,7 +291,7 @@ bool VirtualHost::usesRuntime() const {
   return uses;
 }
 
-VirtualHost::VirtualClusterEntry::VirtualClusterEntry(const Json::Object& virtual_cluster) {
+VirtualHostImpl::VirtualClusterEntry::VirtualClusterEntry(const Json::Object& virtual_cluster) {
   if (virtual_cluster.hasObject("method")) {
     method_ = virtual_cluster.getString("method");
   }
@@ -280,7 +304,7 @@ VirtualHost::VirtualClusterEntry::VirtualClusterEntry(const Json::Object& virtua
 RouteMatcher::RouteMatcher(const Json::Object& config, Runtime::Loader& runtime,
                            Upstream::ClusterManager& cm) {
   for (const Json::ObjectPtr& virtual_host_config : config.getObjectArray("virtual_hosts")) {
-    VirtualHostPtr virtual_host(new VirtualHost(*virtual_host_config, runtime, cm));
+    VirtualHostPtr virtual_host(new VirtualHostImpl(*virtual_host_config, runtime, cm));
     uses_runtime_ |= virtual_host->usesRuntime();
 
     for (const std::string& domain : virtual_host_config->getStringArray("domains")) {
@@ -301,26 +325,19 @@ RouteMatcher::RouteMatcher(const Json::Object& config, Runtime::Loader& runtime,
   }
 }
 
-const RedirectEntry* VirtualHost::redirectFromEntries(const Http::HeaderMap& headers,
-                                                      uint64_t random_value) const {
-  // First we check to see if we have any vhost level SSL requirements.
+const Route* VirtualHostImpl::getRouteFromEntries(const Http::HeaderMap& headers,
+                                                  uint64_t random_value) const {
+  // First check for ssl redirect.
   if (ssl_requirements_ == SslRequirements::ALL && headers.ForwardedProto()->value() != "https") {
-    return &SSL_REDIRECTOR;
+    return &SSL_REDIRECT_ROUTE;
   } else if (ssl_requirements_ == SslRequirements::EXTERNAL_ONLY &&
              headers.ForwardedProto()->value() != "https" && !headers.EnvoyInternalRequest()) {
-    return &SSL_REDIRECTOR;
-  } else {
-    // See if there is a route level redirect that we need to do. We search for a route entry
-    // and see if it has redirect information on it.
-    return routeFromEntries(headers, true, random_value);
+    return &SSL_REDIRECT_ROUTE;
   }
-}
 
-const RouteEntryImplBase* VirtualHost::routeFromEntries(const Http::HeaderMap& headers,
-                                                        bool redirect,
-                                                        uint64_t random_value) const {
+  // Check for a route that matches the request.
   for (const RouteEntryImplBasePtr& route : routes_) {
-    if (redirect == route->isRedirect() && route->matches(headers, random_value)) {
+    if (route->matches(headers, random_value)) {
       return route.get();
     }
   }
@@ -328,7 +345,7 @@ const RouteEntryImplBase* VirtualHost::routeFromEntries(const Http::HeaderMap& h
   return nullptr;
 }
 
-const VirtualHost* RouteMatcher::findVirtualHost(const Http::HeaderMap& headers) const {
+const VirtualHostImpl* RouteMatcher::findVirtualHost(const Http::HeaderMap& headers) const {
   // Fast path the case where we only have a default virtual host.
   if (virtual_hosts_.empty() && default_virtual_host_) {
     return default_virtual_host_.get();
@@ -344,30 +361,21 @@ const VirtualHost* RouteMatcher::findVirtualHost(const Http::HeaderMap& headers)
   return nullptr;
 }
 
-const RedirectEntry* RouteMatcher::redirectRequest(const Http::HeaderMap& headers,
-                                                   uint64_t random_value) const {
-  const VirtualHost* virtual_host = findVirtualHost(headers);
+const Route* RouteMatcher::route(const Http::HeaderMap& headers, uint64_t random_value) const {
+  const VirtualHostImpl* virtual_host = findVirtualHost(headers);
   if (virtual_host) {
-    return virtual_host->redirectFromEntries(headers, random_value);
+    return virtual_host->getRouteFromEntries(headers, random_value);
   } else {
     return nullptr;
   }
 }
 
-const RouteEntry* RouteMatcher::routeForRequest(const Http::HeaderMap& headers,
-                                                uint64_t random_value) const {
-  const VirtualHost* virtual_host = findVirtualHost(headers);
-  if (virtual_host) {
-    return virtual_host->routeFromEntries(headers, false, random_value);
-  } else {
-    return nullptr;
-  }
-}
+const VirtualHostImpl::CatchAllVirtualCluster VirtualHostImpl::VIRTUAL_CLUSTER_CATCH_ALL;
+const SslRedirector SslRedirectRoute::SSL_REDIRECTOR;
+const SslRedirectRoute VirtualHostImpl::SSL_REDIRECT_ROUTE;
 
-const VirtualHost::CatchAllVirtualCluster VirtualHost::VIRTUAL_CLUSTER_CATCH_ALL;
-const SslRedirector VirtualHost::SSL_REDIRECTOR;
-
-const VirtualCluster* VirtualHost::virtualClusterFromEntries(const Http::HeaderMap& headers) const {
+const VirtualCluster*
+VirtualHostImpl::virtualClusterFromEntries(const Http::HeaderMap& headers) const {
   for (const VirtualClusterEntry& entry : virtual_clusters_) {
     bool method_matches =
         !entry.method_.valid() || headers.Method()->value().c_str() == entry.method_.value();

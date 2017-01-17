@@ -111,6 +111,19 @@ public:
   Upstream::ResourcePriority priority_{Upstream::ResourcePriority::Default};
 };
 
+class MockVirtualHost : public VirtualHost {
+public:
+  MockVirtualHost();
+  ~MockVirtualHost();
+
+  // Router::VirtualHost
+  MOCK_CONST_METHOD0(name, const std::string&());
+  MOCK_CONST_METHOD0(rateLimitPolicy, const RateLimitPolicy&());
+
+  std::string name_{"fake_vhost"};
+  testing::NiceMock<MockRateLimitPolicy> rate_limit_policy_;
+};
+
 class MockRouteEntry : public RouteEntry {
 public:
   MockRouteEntry();
@@ -126,13 +139,14 @@ public:
   MOCK_CONST_METHOD0(timeout, std::chrono::milliseconds());
   MOCK_CONST_METHOD1(virtualCluster, const VirtualCluster*(const Http::HeaderMap& headers));
   MOCK_CONST_METHOD0(virtualHostName, const std::string&());
+  MOCK_CONST_METHOD0(virtualHost, const VirtualHost&());
 
   std::string cluster_name_{"fake_cluster"};
-  std::string vhost_name_{"fake_vhost"};
   TestVirtualCluster virtual_cluster_;
   TestRetryPolicy retry_policy_;
   testing::NiceMock<MockRateLimitPolicy> rate_limit_policy_;
   TestShadowPolicy shadow_policy_;
+  testing::NiceMock<MockVirtualHost> virtual_host_;
 };
 
 class MockConfig : public Config {
@@ -141,10 +155,7 @@ public:
   ~MockConfig();
 
   // Router::Config
-  MOCK_CONST_METHOD2(redirectRequest,
-                     const RedirectEntry*(const Http::HeaderMap& headers, uint64_t random_value));
-  MOCK_CONST_METHOD2(routeForRequest,
-                     const RouteEntry*(const Http::HeaderMap&, uint64_t random_value));
+  MOCK_CONST_METHOD2(route, const Route*(const Http::HeaderMap&, uint64_t random_value));
   MOCK_CONST_METHOD0(internalOnlyHeaders, const std::list<Http::LowerCaseString>&());
   MOCK_CONST_METHOD0(responseHeadersToAdd,
                      const std::list<std::pair<Http::LowerCaseString, std::string>>&());
@@ -156,16 +167,27 @@ public:
   std::list<Http::LowerCaseString> response_headers_to_remove_;
 };
 
+class MockRoute : public Route {
+public:
+  MockRoute();
+  ~MockRoute();
+
+  // Router::Route
+  MOCK_CONST_METHOD0(redirectEntry, const RedirectEntry*());
+  MOCK_CONST_METHOD0(routeEntry, const RouteEntry*());
+
+  testing::NiceMock<MockRouteEntry> route_entry_;
+};
+
 class MockStableRouteTable : public StableRouteTable {
 public:
   MockStableRouteTable();
   ~MockStableRouteTable();
 
   // Router::StableRouteTable
-  MOCK_CONST_METHOD1(redirectRequest, const RedirectEntry*(const Http::HeaderMap& headers));
-  MOCK_CONST_METHOD1(routeForRequest, const RouteEntry*(const Http::HeaderMap&));
+  MOCK_CONST_METHOD1(route, const Route*(const Http::HeaderMap&));
 
-  testing::NiceMock<MockRouteEntry> route_entry_;
+  testing::NiceMock<MockRoute> route_;
 };
 
 } // Router

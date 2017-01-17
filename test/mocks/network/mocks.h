@@ -27,7 +27,6 @@ public:
 
   testing::NiceMock<Event::MockDispatcher> dispatcher_;
   std::list<Network::ConnectionCallbacks*> callbacks_;
-  bool closed_{};
   uint64_t id_{next_id_++};
   std::string remote_address_;
   bool read_enabled_{true};
@@ -91,16 +90,24 @@ public:
   MOCK_METHOD0(connect, void());
 };
 
+class MockActiveDnsQuery : public ActiveDnsQuery {
+public:
+  MockActiveDnsQuery();
+  ~MockActiveDnsQuery();
+
+  // Network::ActiveDnsQuery
+  MOCK_METHOD0(cancel, void());
+};
+
 class MockDnsResolver : public DnsResolver {
 public:
   MockDnsResolver();
   ~MockDnsResolver();
 
   // Network::DnsResolver
-  MOCK_METHOD0(dispatcher, Event::Dispatcher&());
-  MOCK_METHOD2(resolve, void(const std::string& dns_name, ResolveCb callback));
+  MOCK_METHOD2(resolve, ActiveDnsQuery&(const std::string& dns_name, ResolveCb callback));
 
-  testing::NiceMock<Event::MockDispatcher> dispatcher_;
+  testing::NiceMock<MockActiveDnsQuery> active_query_;
 };
 
 class MockReadFilterCallbacks : public ReadFilterCallbacks {
@@ -190,6 +197,22 @@ class MockListener : public Listener {
 public:
   MockListener();
   ~MockListener();
+};
+
+class MockConnectionHandler : public ConnectionHandler {
+public:
+  MockConnectionHandler();
+  ~MockConnectionHandler();
+
+  MOCK_METHOD0(numConnections, uint64_t());
+  MOCK_METHOD5(addListener,
+               void(Network::FilterChainFactory& factory, Network::ListenSocket& socket,
+                    bool bind_to_port, bool use_proxy_proto, bool use_orig_dst));
+  MOCK_METHOD6(addSslListener, void(Network::FilterChainFactory& factory,
+                                    Ssl::ServerContext& ssl_ctx, Network::ListenSocket& socket,
+                                    bool bind_to_port, bool use_proxy_proto, bool use_orig_dst));
+  MOCK_METHOD1(findListener, Network::Listener*(const std::string& socket_name));
+  MOCK_METHOD0(closeListeners, void());
 };
 
 } // Network

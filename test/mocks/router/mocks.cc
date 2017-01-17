@@ -22,6 +22,7 @@ MockRetryState::~MockRetryState() {}
 MockRateLimitPolicyEntry::MockRateLimitPolicyEntry() {
   ON_CALL(*this, routeKey()).WillByDefault(ReturnRef(route_key_));
 }
+
 MockRateLimitPolicyEntry::~MockRateLimitPolicyEntry() {}
 
 MockRateLimitPolicy::MockRateLimitPolicy() {
@@ -33,6 +34,13 @@ MockRateLimitPolicy::~MockRateLimitPolicy() {}
 MockShadowWriter::MockShadowWriter() {}
 MockShadowWriter::~MockShadowWriter() {}
 
+MockVirtualHost::MockVirtualHost() {
+  ON_CALL(*this, name()).WillByDefault(ReturnRef(name_));
+  ON_CALL(*this, rateLimitPolicy()).WillByDefault(ReturnRef(rate_limit_policy_));
+}
+
+MockVirtualHost::~MockVirtualHost() {}
+
 MockRouteEntry::MockRouteEntry() {
   ON_CALL(*this, clusterName()).WillByDefault(ReturnRef(cluster_name_));
   ON_CALL(*this, rateLimitPolicy()).WillByDefault(ReturnRef(rate_limit_policy_));
@@ -40,7 +48,7 @@ MockRouteEntry::MockRouteEntry() {
   ON_CALL(*this, shadowPolicy()).WillByDefault(ReturnRef(shadow_policy_));
   ON_CALL(*this, timeout()).WillByDefault(Return(std::chrono::milliseconds(10)));
   ON_CALL(*this, virtualCluster(_)).WillByDefault(Return(&virtual_cluster_));
-  ON_CALL(*this, virtualHostName()).WillByDefault(ReturnRef(vhost_name_));
+  ON_CALL(*this, virtualHost()).WillByDefault(ReturnRef(virtual_host_));
 }
 
 MockRouteEntry::~MockRouteEntry() {}
@@ -53,8 +61,11 @@ MockConfig::MockConfig() {
 
 MockConfig::~MockConfig() {}
 
+MockRoute::MockRoute() { ON_CALL(*this, routeEntry()).WillByDefault(Return(&route_entry_)); }
+MockRoute::~MockRoute() {}
+
 MockStableRouteTable::MockStableRouteTable() {
-  ON_CALL(*this, routeForRequest(_)).WillByDefault(Return(&route_entry_));
+  ON_CALL(*this, route(_)).WillByDefault(Return(&route_));
 }
 
 MockStableRouteTable::~MockStableRouteTable() {}
