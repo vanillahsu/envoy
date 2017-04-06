@@ -33,19 +33,21 @@ public:
 
   /**
    * Create a client connection.
-   * @param url supplies the URL to connect to.
+   * @param address supplies the address to connect to.
    * @return Network::ClientConnectionPtr a client connection that is owned by the caller.
    */
-  virtual Network::ClientConnectionPtr createClientConnection(const std::string& url) PURE;
+  virtual Network::ClientConnectionPtr
+  createClientConnection(Network::Address::InstanceConstSharedPtr address) PURE;
 
   /**
    * Create an SSL client connection.
    * @param ssl_ctx supplies the SSL context to use.
-   * @param url supplies the URL to connect to.
+   * @param address supplies the address to connect to.
    * @return Network::ClientConnectionPtr a client connection that is owned by the caller.
    */
-  virtual Network::ClientConnectionPtr createSslClientConnection(Ssl::ClientContext& ssl_ctx,
-                                                                 const std::string& url) PURE;
+  virtual Network::ClientConnectionPtr
+  createSslClientConnection(Ssl::ClientContext& ssl_ctx,
+                            Network::Address::InstanceConstSharedPtr address) PURE;
 
   /**
    * Create an async DNS resolver. Only a single resolver can exist in the process at a time and it
@@ -59,8 +61,12 @@ public:
    * can be used for any file like interface (files, sockets, etc.).
    * @param fd supplies the fd to watch.
    * @param cb supplies the callback to fire when the file is ready.
+   * @param trigger specifies whether to edge or level trigger.
+   * @param events supplies a logical OR of FileReadyType events that the file event should
+   *               initially listen on.
    */
-  virtual FileEventPtr createFileEvent(int fd, FileReadyCb cb) PURE;
+  virtual FileEventPtr createFileEvent(int fd, FileReadyCb cb, FileTriggerType trigger,
+                                       uint32_t events) PURE;
 
   /**
    * @return Filesystem::WatcherPtr a filesystem watcher owned by the caller.
@@ -72,21 +78,14 @@ public:
    * @param conn_handler supplies the handler for connections received by the listener
    * @param socket supplies the socket to listen on.
    * @param cb supplies the callbacks to invoke for listener events.
-   * @param stats_store supplies the Stats::Store to use.
-   * @param bind_to_port specifies if the listener should actually bind to the port.
-   *        a listener that doesn't bind can only receive connections redirected from
-   *        other listeners that that set use_origin_dst to true
-   * @param use_proxy_proto whether to use the PROXY Protocol V1
-   * (http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt)
-   * @param use_orig_dst if a connection was redirected to this port using iptables,
-   *        allow the listener to hand it off to the listener associated to the original port
+   * @param scope supplies the Stats::Scope to use.
+   * @param listener_options listener configuration options.
    * @return Network::ListenerPtr a new listener that is owned by the caller.
    */
-  virtual Network::ListenerPtr createListener(Network::ConnectionHandler& conn_handler,
-                                              Network::ListenSocket& socket,
-                                              Network::ListenerCallbacks& cb,
-                                              Stats::Store& stats_store, bool bind_to_port,
-                                              bool use_proxy_proto, bool use_orig_dst) PURE;
+  virtual Network::ListenerPtr
+  createListener(Network::ConnectionHandler& conn_handler, Network::ListenSocket& socket,
+                 Network::ListenerCallbacks& cb, Stats::Scope& scope,
+                 const Network::ListenerOptions& listener_options) PURE;
 
   /**
    * Create a listener on a specific port.
@@ -94,22 +93,14 @@ public:
    * @param ssl_ctx supplies the SSL context to use.
    * @param socket supplies the socket to listen on.
    * @param cb supplies the callbacks to invoke for listener events.
-   * @param stats_store supplies the Stats::Store to use.
-   * @param bind_to_port specifies if the listener should actually bind to the port.
-   *        a listener that doesn't bind can only receive connections redirected from
-   *        other listeners that set use_origin_dst to true
-   * @param use_proxy_proto whether to use the PROXY Protocol V1
-   * (http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt)
-   * @param use_orig_dst if a connection was redirected to this port using iptables,
-   *        allow the listener to hand it off to the listener associated to the original port
+   * @param scope supplies the Stats::Scope to use.
+   * @param listener_options listener configuration options.
    * @return Network::ListenerPtr a new listener that is owned by the caller.
    */
-  virtual Network::ListenerPtr createSslListener(Network::ConnectionHandler& conn_handler,
-                                                 Ssl::ServerContext& ssl_ctx,
-                                                 Network::ListenSocket& socket,
-                                                 Network::ListenerCallbacks& cb,
-                                                 Stats::Store& stats_store, bool bind_to_port,
-                                                 bool use_proxy_proto, bool use_orig_dst) PURE;
+  virtual Network::ListenerPtr
+  createSslListener(Network::ConnectionHandler& conn_handler, Ssl::ServerContext& ssl_ctx,
+                    Network::ListenSocket& socket, Network::ListenerCallbacks& cb,
+                    Stats::Scope& scope, const Network::ListenerOptions& listener_options) PURE;
 
   /**
    * Allocate a timer. @see Event::Timer for docs on how to use the timer.

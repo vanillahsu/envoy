@@ -1,4 +1,4 @@
-#include "tcp_proxy.h"
+#include "common/filter/tcp_proxy.h"
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/event/dispatcher.h"
@@ -8,20 +8,87 @@
 #include "envoy/upstream/upstream.h"
 
 #include "common/common/assert.h"
+#include "common/common/empty_string.h"
+#include "common/json/config_schemas.h"
 #include "common/json/json_loader.h"
 
 namespace Filter {
 
-TcpProxyConfig::TcpProxyConfig(const Json::Object& config,
-                               Upstream::ClusterManager& cluster_manager, Stats::Store& stats_store)
-    : cluster_name_(config.getString("cluster")),
-      stats_(generateStats(config.getString("stat_prefix"), stats_store)) {
-  if (!cluster_manager.get(cluster_name_)) {
-    throw EnvoyException(fmt::format("tcp proxy: unknown cluster '{}'", cluster_name_));
+TcpProxyConfig::Route::Route(const Json::Object& config) {
+  cluster_name_ = config.getString("cluster");
+
+  if (config.hasObject("source_ip_list")) {
+    source_ips_ = Network::IpList(config.getStringArray("source_ip_list"));
+  }
+
+  if (config.hasObject("source_ports")) {
+    const std::string source_ports = config.getString("source_ports");
+    if (source_ports.empty()) {
+      throw EnvoyException("source_ports cannot be empty");
+    }
+    Network::Utility::parsePortRangeList(source_ports, source_port_ranges_);
+  }
+
+  if (config.hasObject("destination_ip_list")) {
+    destination_ips_ = Network::IpList(config.getStringArray("destination_ip_list"));
+  }
+
+  if (config.hasObject("destination_ports")) {
+    const std::string destination_ports = config.getString("destination_ports");
+    if (destination_ports.empty()) {
+      throw EnvoyException("destination_ports cannot be empty");
+    }
+    Network::Utility::parsePortRangeList(destination_ports, destination_port_ranges_);
   }
 }
 
-TcpProxy::TcpProxy(TcpProxyConfigPtr config, Upstream::ClusterManager& cluster_manager)
+TcpProxyConfig::TcpProxyConfig(const Json::Object& config,
+                               Upstream::ClusterManager& cluster_manager, Stats::Store& stats_store)
+    : stats_(generateStats(config.getString("stat_prefix"), stats_store)) {
+  config.validateSchema(Json::Schema::TCP_PROXY_NETWORK_FILTER_SCHEMA);
+
+  for (const Json::ObjectPtr& route_desc :
+       config.getObject("route_config")->getObjectArray("routes")) {
+    routes_.emplace_back(Route(*route_desc));
+
+    if (!cluster_manager.get(route_desc->getString("cluster"))) {
+      throw EnvoyException(fmt::format("tcp proxy: unknown cluster '{}' in TCP route",
+                                       route_desc->getString("cluster")));
+    }
+  }
+}
+
+const std::string& TcpProxyConfig::getRouteFromEntries(Network::Connection& connection) {
+  for (const TcpProxyConfig::Route& route : routes_) {
+    if (!route.source_port_ranges_.empty() &&
+        !Network::Utility::portInRangeList(connection.remoteAddress(), route.source_port_ranges_)) {
+      continue;
+    }
+
+    if (!route.source_ips_.empty() && !route.source_ips_.contains(connection.remoteAddress())) {
+      continue;
+    }
+
+    if (!route.destination_port_ranges_.empty() &&
+        !Network::Utility::portInRangeList(connection.localAddress(),
+                                           route.destination_port_ranges_)) {
+      continue;
+    }
+
+    if (!route.destination_ips_.empty() &&
+        !route.destination_ips_.contains(connection.localAddress())) {
+      continue;
+    }
+
+    // if we made it past all checks, the route matches
+    return route.cluster_name_;
+  }
+
+  // no match, no more routes to try
+  return EMPTY_STRING;
+}
+
+TcpProxy::TcpProxy(TcpProxyConfigSharedPtr config, Upstream::ClusterManager& cluster_manager)
     : config_(config), cluster_manager_(cluster_manager), downstream_callbacks_(*this),
       upstream_callbacks_(new UpstreamCallbacks(*this)) {}
 
@@ -48,6 +115,7 @@ TcpProxyStats TcpProxyConfig::generateStats(const std::string& name, Stats::Stor
 void TcpProxy::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) {
   read_callbacks_ = &callbacks;
   conn_log_info("new tcp proxy session", read_callbacks_->connection());
+  config_->stats().downstream_cx_total_.inc();
   read_callbacks_->connection().addConnectionCallbacks(downstream_callbacks_);
   read_callbacks_->connection().setBufferStats({config_->stats().downstream_cx_rx_bytes_total_,
                                                 config_->stats().downstream_cx_rx_bytes_buffered_,
@@ -56,14 +124,26 @@ void TcpProxy::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callb
 }
 
 Network::FilterStatus TcpProxy::initializeUpstreamConnection() {
-  Upstream::ClusterInfoPtr cluster = cluster_manager_.get(config_->clusterName());
+  const std::string& cluster_name = config_->getRouteFromEntries(read_callbacks_->connection());
+
+  Upstream::ThreadLocalCluster* thread_local_cluster = cluster_manager_.get(cluster_name);
+
+  if (thread_local_cluster) {
+    conn_log_debug("Creating connection to cluster {}", read_callbacks_->connection(),
+                   cluster_name);
+  } else {
+    config_->stats().downstream_cx_no_route_.inc();
+    read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+    return Network::FilterStatus::StopIteration;
+  }
+
+  Upstream::ClusterInfoConstSharedPtr cluster = thread_local_cluster->info();
   if (!cluster->resourceManager(Upstream::ResourcePriority::Default).connections().canCreate()) {
     cluster->stats().upstream_cx_overflow_.inc();
     read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
     return Network::FilterStatus::StopIteration;
   }
-  Upstream::Host::CreateConnectionData conn_info =
-      cluster_manager_.tcpConnForCluster(config_->clusterName());
+  Upstream::Host::CreateConnectionData conn_info = cluster_manager_.tcpConnForCluster(cluster_name);
 
   upstream_connection_ = std::move(conn_info.connection_);
   read_callbacks_->upstreamHost(conn_info.host_description_);
@@ -118,10 +198,10 @@ void TcpProxy::onDownstreamEvent(uint32_t event) {
   if ((event & Network::ConnectionEvent::RemoteClose ||
        event & Network::ConnectionEvent::LocalClose) &&
       upstream_connection_) {
-    // TODO: If we close without flushing here we may drop some data. The downstream connection
-    //       is about to go away. So to support this we need to either have a way for the downstream
-    //       connection to stick around, or, we need to be able to pass this connection to a flush
-    //       worker which will attempt to flush the remaining data with a timeout.
+    // TODO(mattklein123): If we close without flushing here we may drop some data. The downstream
+    // connection is about to go away. So to support this we need to either have a way for the
+    // downstream connection to stick around, or, we need to be able to pass this connection to a
+    // flush worker which will attempt to flush the remaining data with a timeout.
     upstream_connection_->close(Network::ConnectionCloseType::NoFlush);
   }
 }

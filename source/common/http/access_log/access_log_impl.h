@@ -106,13 +106,8 @@ public:
  */
 class TraceableRequestFilter : public Filter {
 public:
-  TraceableRequestFilter(Runtime::Loader& runtime);
-
   // Http::AccessLog::Filter
   bool evaluate(const RequestInfo& info, const HeaderMap& request_headers) override;
-
-private:
-  Runtime::Loader& runtime_;
 };
 
 /**
@@ -135,15 +130,15 @@ public:
   InstanceImpl(const std::string& access_log_path, FilterPtr&& filter, FormatterPtr&& formatter,
                ::AccessLog::AccessLogManager& log_manager);
 
-  static InstancePtr fromJson(Json::Object& json, Runtime::Loader& runtime,
-                              ::AccessLog::AccessLogManager& log_manager);
+  static InstanceSharedPtr fromJson(Json::Object& json, Runtime::Loader& runtime,
+                                    ::AccessLog::AccessLogManager& log_manager);
 
   // Http::AccessLog::Instance
   void log(const HeaderMap* request_headers, const HeaderMap* response_headers,
            const RequestInfo& request_info) override;
 
 private:
-  Filesystem::FilePtr log_file_;
+  Filesystem::FileSharedPtr log_file_;
   FilterPtr filter_;
   FormatterPtr formatter_;
 };

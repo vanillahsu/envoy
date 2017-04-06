@@ -1,4 +1,4 @@
-#include "fault_filter.h"
+#include "common/http/filter/fault_filter.h"
 
 #include "envoy/event/timer.h"
 #include "envoy/http/codes.h"
@@ -10,6 +10,8 @@
 #include "common/http/codes.h"
 #include "common/http/header_map_impl.h"
 #include "common/http/headers.h"
+#include "common/json/config_schemas.h"
+#include "common/router/config_impl.h"
 
 namespace Http {
 
@@ -17,8 +19,16 @@ FaultFilterConfig::FaultFilterConfig(const Json::Object& json_config, Runtime::L
                                      const std::string& stat_prefix, Stats::Store& stats)
     : runtime_(runtime), stats_(generateStats(stat_prefix, stats)) {
 
-  if (json_config.hasObject("abort")) {
-    const Json::ObjectPtr& abort = json_config.getObject("abort");
+  json_config.validateSchema(Json::Schema::FAULT_HTTP_FILTER_SCHEMA);
+
+  const Json::ObjectPtr abort = json_config.getObject("abort", true);
+  const Json::ObjectPtr delay = json_config.getObject("delay", true);
+
+  if (abort->empty() && delay->empty()) {
+    throw EnvoyException("fault filter must have at least abort or delay specified in the config.");
+  }
+
+  if (!abort->empty()) {
     abort_percent_ = static_cast<uint64_t>(abort->getInteger("abort_percent", 0));
 
     if (abort_percent_ > 0) {
@@ -27,7 +37,7 @@ FaultFilterConfig::FaultFilterConfig(const Json::Object& json_config, Runtime::L
       }
     }
 
-    // TODO: Throw error if invalid return code is provided
+    // TODO(mattklein123): Throw error if invalid return code is provided
     if (abort->hasObject("http_status")) {
       http_status_ = static_cast<uint64_t>(abort->getInteger("http_status"));
     } else {
@@ -35,8 +45,7 @@ FaultFilterConfig::FaultFilterConfig(const Json::Object& json_config, Runtime::L
     }
   }
 
-  if (json_config.hasObject("delay")) {
-    const Json::ObjectPtr& delay = json_config.getObject("delay");
+  if (!delay->empty()) {
     const std::string type = delay->getString("type", "empty");
     if (type == "fixed") {
       fixed_delay_percent_ = static_cast<uint64_t>(delay->getInteger("fixed_delay_percent", 0));
@@ -58,15 +67,14 @@ FaultFilterConfig::FaultFilterConfig(const Json::Object& json_config, Runtime::L
   if (json_config.hasObject("headers")) {
     std::vector<Json::ObjectPtr> config_headers = json_config.getObjectArray("headers");
     for (const Json::ObjectPtr& header_map : config_headers) {
-      // allow header value to be empty, allows matching to be only based on header presence.
-      fault_filter_headers_.emplace_back(Http::LowerCaseString(header_map->getString("name")),
-                                         header_map->getString("value", EMPTY_STRING),
-                                         header_map->getBoolean("regex", false));
+      fault_filter_headers_.push_back(*header_map);
     }
   }
+
+  upstream_cluster_ = json_config.getString("upstream_cluster", EMPTY_STRING);
 }
 
-FaultFilter::FaultFilter(FaultFilterConfigPtr config) : config_(config) {}
+FaultFilter::FaultFilter(FaultFilterConfigSharedPtr config) : config_(config) {}
 
 FaultFilter::~FaultFilter() { ASSERT(!delay_timer_); }
 
@@ -75,7 +83,11 @@ FaultFilter::~FaultFilter() { ASSERT(!delay_timer_); }
 // if we inject a delay, then we will inject the abort in the delay timer
 // callback.
 FilterHeadersStatus FaultFilter::decodeHeaders(HeaderMap& headers, bool) {
-  // Check for header matches first
+  if (!matchesTargetCluster()) {
+    return FilterHeadersStatus::Continue;
+  }
+
+  // Check for header matches
   if (!Router::ConfigUtility::matchHeaders(headers, config_->filterHeaders())) {
     return FilterHeadersStatus::Continue;
   }
@@ -133,13 +145,25 @@ void FaultFilter::postDelayInjection() {
 }
 
 void FaultFilter::abortWithHTTPStatus() {
-  // TODO: check http status codes obtained from runtime
+  // TODO(mattklein123): check http status codes obtained from runtime
   Http::HeaderMapPtr response_headers{new HeaderMapImpl{
       {Headers::get().Status, std::to_string(config_->runtime().snapshot().getInteger(
                                   "fault.http.abort.http_status", config_->abortCode()))}}};
   callbacks_->encodeHeaders(std::move(response_headers), true);
   config_->stats().aborts_injected_.inc();
   callbacks_->requestInfo().setResponseFlag(Http::AccessLog::ResponseFlag::FaultInjected);
+}
+
+bool FaultFilter::matchesTargetCluster() {
+  bool matches = true;
+
+  if (!config_->upstreamCluster().empty()) {
+    Router::RouteConstSharedPtr route = callbacks_->route();
+    matches = route && route->routeEntry() &&
+              (route->routeEntry()->clusterName() == config_->upstreamCluster());
+  }
+
+  return matches;
 }
 
 void FaultFilter::resetTimerState() {

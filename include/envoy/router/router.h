@@ -141,6 +141,23 @@ public:
 };
 
 /**
+ * Route hash policy. I.e., if using a hashing load balancer, how the route should be hashed onto
+ * an upstream host.
+ */
+class HashPolicy {
+public:
+  virtual ~HashPolicy() {}
+
+  /**
+   * @return Optional<uint64_t> an optional hash value to route on given a set of HTTP headers.
+   *         A hash value might not be returned if for example the specified HTTP header does not
+   *         exist. In the future we might add additional support for hashing on origin address,
+   *         etc.
+   */
+  virtual Optional<uint64_t> generateHash(const Http::HeaderMap& headers) const PURE;
+};
+
+/**
  * An individual resolved route entry.
  */
 class RouteEntry {
@@ -159,6 +176,11 @@ public:
    * @param headers supplies the request headers, which may be modified during this call.
    */
   virtual void finalizeRequestHeaders(Http::HeaderMap& headers) const PURE;
+
+  /**
+   * @return const HashPolicy* the optional hash policy for the route.
+   */
+  virtual const HashPolicy* hashPolicy() const PURE;
 
   /**
    * @return the priority of the route.
@@ -198,6 +220,17 @@ public:
    * @return const VirtualHost& the virtual host that owns the route.
    */
   virtual const VirtualHost& virtualHost() const PURE;
+
+  /**
+   * @return bool true if the :authority header should be overwritten with the upstream hostname.
+   */
+  virtual bool autoHostRewrite() const PURE;
+
+  /**
+   * @return const std::multimap<std::string, std::string> the opaque configuration associated
+   *         with the route
+   */
+  virtual const std::multimap<std::string, std::string>& opaqueConfig() const PURE;
 };
 
 /**
@@ -218,6 +251,8 @@ public:
   virtual const RouteEntry* routeEntry() const PURE;
 };
 
+typedef std::shared_ptr<const Route> RouteConstSharedPtr;
+
 /**
  * The router configuration.
  */
@@ -233,7 +268,8 @@ public:
    *        allows stable choices between calls if desired.
    * @return the route or nullptr if there is no matching route for the request.
    */
-  virtual const Route* route(const Http::HeaderMap& headers, uint64_t random_value) const PURE;
+  virtual RouteConstSharedPtr route(const Http::HeaderMap& headers,
+                                    uint64_t random_value) const PURE;
 
   /**
    * Return a list of headers that will be cleaned from any requests that are not from an internal
@@ -262,23 +298,6 @@ public:
   virtual bool usesRuntime() const PURE;
 };
 
-typedef std::unique_ptr<Config> ConfigPtr;
-
-/**
- * An interface into the config that removes the random value parameters. An implementation is
- * expected to pass the same random_value for all wrapped calls.
- */
-class StableRouteTable {
-public:
-  virtual ~StableRouteTable() {}
-
-  /**
-   * Based on the incoming HTTP request headers, determine the target route (containing either a
-   * route entry or a redirect entry) for the request.
-   * @param headers supplies the request headers.
-   * @return the route or nullptr if there is no matching route for the request.
-   */
-  virtual const Route* route(const Http::HeaderMap& headers) const PURE;
-};
+typedef std::shared_ptr<const Config> ConfigConstSharedPtr;
 
 } // Router

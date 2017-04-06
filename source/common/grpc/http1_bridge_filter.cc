@@ -1,10 +1,10 @@
-#include "common.h"
-#include "http1_bridge_filter.h"
+#include "common/grpc/http1_bridge_filter.h"
 
 #include "envoy/http/codes.h"
 
 #include "common/common/enum_to_int.h"
 #include "common/common/utility.h"
+#include "common/grpc/common.h"
 #include "common/http/headers.h"
 #include "common/http/http1/codec_impl.h"
 
@@ -95,23 +95,23 @@ Http::FilterTrailersStatus Http1BridgeFilter::encodeTrailers(Http::HeaderMap& tr
 }
 
 void Http1BridgeFilter::setupStatTracking(const Http::HeaderMap& headers) {
-  const Router::Route* route = decoder_callbacks_->routeTable().route(headers);
-  if (!route) {
+  Router::RouteConstSharedPtr route = decoder_callbacks_->route();
+  if (!route || !route->routeEntry()) {
     return;
   }
 
   const Router::RouteEntry* route_entry = route->routeEntry();
-  if (!route_entry) {
+  Upstream::ThreadLocalCluster* cluster = cm_.get(route_entry->clusterName());
+  if (!cluster) {
     return;
   }
+  cluster_ = cluster->info();
 
   std::vector<std::string> parts = StringUtil::split(headers.Path()->value().c_str(), '/');
   if (parts.size() != 2) {
     return;
   }
 
-  // TODO: Cluster may not exist.
-  cluster_ = cm_.get(route_entry->clusterName());
   grpc_service_ = parts[0];
   grpc_method_ = parts[1];
   do_stat_tracking_ = true;

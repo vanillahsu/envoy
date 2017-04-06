@@ -1,5 +1,7 @@
-#include "assert.h"
-#include "thread.h"
+#include "common/common/thread.h"
+
+#include "common/common/assert.h"
+#include "common/common/macros.h"
 
 #if defined(__FreeBSD__)
 #include <pthread_np.h>
@@ -30,23 +32,6 @@ void Thread::join() {
   int rc = pthread_join(thread_id_, nullptr);
   RELEASE_ASSERT(rc == 0);
   UNREFERENCED_PARAMETER(rc);
-}
-
-void ConditionalInitializer::setReady() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  ASSERT(!ready_);
-  ready_ = true;
-  cv_.notify_all();
-}
-
-void ConditionalInitializer::waitReady() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  if (ready_) {
-    return;
-  }
-
-  cv_.wait(lock);
-  ASSERT(ready_);
 }
 
 } // Thread

@@ -15,11 +15,11 @@ set(ENVOY_SPDLOG_INCLUDE_DIR "" CACHE FILEPATH "location of spdlog includes")
 set(ENVOY_HTTP_PARSER_INCLUDE_DIR "" CACHE FILEPATH "location of http-parser includes")
 
 # https://github.com/nghttp2/nghttp2
-# Last tested with 1.14.1
+# Last tested with 1.20.0
 set(ENVOY_NGHTTP2_INCLUDE_DIR "" CACHE FILEPATH "location of nghttp2 includes")
 
 # http://libevent.org/
-# Last tested with 2.0.22
+# Last tested with 2.1.8
 set(ENVOY_LIBEVENT_INCLUDE_DIR "" CACHE FILEPATH "location of libevent includes")
 
 # http://tclap.sourceforge.net/
@@ -31,8 +31,12 @@ set(ENVOY_TCLAP_INCLUDE_DIR "" CACHE FILEPATH "location of tclap includes")
 set(ENVOY_GPERFTOOLS_INCLUDE_DIR "" CACHE FILEPATH "location of gperftools includes")
 
 # https://boringssl.googlesource.com/boringssl/+/chromium-stable
-# Last tested with sha 78684e5b222645828ca302e56b40b9daff2b2d27
+# Last tested with sha b87c80300647c2c0311c1489a104470e099f1531
 set(ENVOY_OPENSSL_INCLUDE_DIR "" CACHE FILEPATH "location of openssl includes")
+
+# https://github.com/c-ares/c-ares
+# Last tested with 1.12.0
+set(ENVOY_CARES_INCLUDE_DIR "" CACHE FILEPATH "location of c-ares includes")
 
 # https://github.com/google/protobuf
 # Last tested with 3.0.0
@@ -40,7 +44,7 @@ set(ENVOY_PROTOBUF_INCLUDE_DIR "" CACHE FILEPATH "location of protobuf includes"
 set(ENVOY_PROTOBUF_PROTOC "" CACHE FILEPATH "location of protoc")
 
 # http://lightstep.com/
-# Last tested with lightstep-tracer-cpp-0.19
+# Last tested with lightstep-tracer-cpp-0.36
 set(ENVOY_LIGHTSTEP_TRACER_INCLUDE_DIR "" CACHE FILEPATH "location of lighstep tracer includes")
 
 # https://github.com/miloyip/rapidjson

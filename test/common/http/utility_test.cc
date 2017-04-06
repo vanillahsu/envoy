@@ -1,6 +1,7 @@
 #include "common/http/exception.h"
 #include "common/http/header_map_impl.h"
 #include "common/http/utility.h"
+#include "common/network/address_impl.h"
 
 #include "test/test_common/utility.h"
 
@@ -54,14 +55,23 @@ TEST(HttpUtility, isInternalRequest) {
 TEST(HttpUtility, appendXff) {
   {
     TestHeaderMapImpl headers;
-    Utility::appendXff(headers, "127.0.0.1");
+    Network::Address::Ipv4Instance address("127.0.0.1");
+    Utility::appendXff(headers, address);
     EXPECT_EQ("127.0.0.1", headers.get_("x-forwarded-for"));
   }
 
   {
     TestHeaderMapImpl headers{{"x-forwarded-for", "10.0.0.1"}};
-    Utility::appendXff(headers, "127.0.0.1");
+    Network::Address::Ipv4Instance address("127.0.0.1");
+    Utility::appendXff(headers, address);
     EXPECT_EQ("10.0.0.1, 127.0.0.1", headers.get_("x-forwarded-for"));
+  }
+
+  {
+    TestHeaderMapImpl headers{{"x-forwarded-for", "10.0.0.1"}};
+    Network::Address::PipeInstance address("/foo");
+    Utility::appendXff(headers, address);
+    EXPECT_EQ("10.0.0.1", headers.get_("x-forwarded-for"));
   }
 }
 
@@ -94,13 +104,20 @@ TEST(HttpUtility, TwoAddressesInXFF) {
   const std::string first_address = "34.0.0.1";
   const std::string second_address = "10.0.0.1";
   TestHeaderMapImpl request_headers{
-      {"x-forwarded-for", fmt::format("{0},{1}", first_address, second_address)}};
+      {"x-forwarded-for", fmt::format("{0}, {0}, {1}", first_address, second_address)}};
   EXPECT_EQ(second_address, Utility::getLastAddressFromXFF(request_headers));
 }
 
 TEST(HttpUtility, EmptyXFF) {
-  TestHeaderMapImpl request_headers;
-  EXPECT_EQ("", Utility::getLastAddressFromXFF(request_headers));
+  {
+    TestHeaderMapImpl request_headers{{"x-forwarded-for", ""}};
+    EXPECT_EQ("", Utility::getLastAddressFromXFF(request_headers));
+  }
+
+  {
+    TestHeaderMapImpl request_headers;
+    EXPECT_EQ("", Utility::getLastAddressFromXFF(request_headers));
+  }
 }
 
 TEST(HttpUtility, OneAddressInXFF) {
@@ -119,6 +136,19 @@ TEST(HttpUtility, TestParseCookie) {
   std::string key{"token"};
   std::string value = Utility::parseCookieValue(headers, key);
   EXPECT_EQ(value, "abc123");
+}
+
+TEST(HttpUtility, TestParseCookieWithQuotes) {
+  TestHeaderMapImpl headers{
+      {"someheader", "10.0.0.1"},
+      {"cookie", "dquote=\"; quoteddquote=\"\"\""},
+      {"cookie", "leadingdquote=\"foobar;"},
+      {"cookie", "abc=def; token=\"abc123\"; Expires=Wed, 09 Jun 2021 10:18:14 GMT"}};
+
+  EXPECT_EQ(Utility::parseCookieValue(headers, "token"), "abc123");
+  EXPECT_EQ(Utility::parseCookieValue(headers, "dquote"), "\"");
+  EXPECT_EQ(Utility::parseCookieValue(headers, "quoteddquote"), "\"");
+  EXPECT_EQ(Utility::parseCookieValue(headers, "leadingdquote"), "\"foobar");
 }
 
 } // Http

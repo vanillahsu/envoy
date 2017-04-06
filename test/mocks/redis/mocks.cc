@@ -41,7 +41,12 @@ bool operator==(const RespValue& lhs, const RespValue& rhs) {
   NOT_IMPLEMENTED;
 }
 
-MockEncoder::MockEncoder() {}
+MockEncoder::MockEncoder() {
+  ON_CALL(*this, encode(_, _))
+      .WillByDefault(Invoke([this](const RespValue& value, Buffer::Instance& out)
+                                -> void { real_encoder_.encode(value, out); }));
+}
+
 MockEncoder::~MockEncoder() {}
 
 MockDecoder::MockDecoder() {}
@@ -60,14 +65,27 @@ MockClient::MockClient() {
 
 MockClient::~MockClient() {}
 
-MockActiveRequest::MockActiveRequest() {}
-MockActiveRequest::~MockActiveRequest() {}
+MockPoolRequest::MockPoolRequest() {}
+MockPoolRequest::~MockPoolRequest() {}
 
-MockActiveRequestCallbacks::MockActiveRequestCallbacks() {}
-MockActiveRequestCallbacks::~MockActiveRequestCallbacks() {}
+MockPoolCallbacks::MockPoolCallbacks() {}
+MockPoolCallbacks::~MockPoolCallbacks() {}
 
 MockInstance::MockInstance() {}
 MockInstance::~MockInstance() {}
 
 } // ConnPool
+
+namespace CommandSplitter {
+
+MockSplitRequest::MockSplitRequest() {}
+MockSplitRequest::~MockSplitRequest() {}
+
+MockSplitCallbacks::MockSplitCallbacks() {}
+MockSplitCallbacks::~MockSplitCallbacks() {}
+
+MockInstance::MockInstance() {}
+MockInstance::~MockInstance() {}
+
+} // CommandSplitter
 } // Redis

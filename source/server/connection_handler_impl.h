@@ -36,7 +36,7 @@ struct ListenerStats {
  */
 class ConnectionHandlerImpl : public Network::ConnectionHandler, NonCopyable {
 public:
-  ConnectionHandlerImpl(Stats::Store& stats_store, spdlog::logger& logger, Api::ApiPtr&& api);
+  ConnectionHandlerImpl(spdlog::logger& logger, Api::ApiPtr&& api);
   ~ConnectionHandlerImpl();
 
   Api::Api& api() { return *api_; }
@@ -47,23 +47,17 @@ public:
    */
   void closeConnections();
 
-  /**
-   * Start a watchdog that attempts to tick every 100ms and will increment a stat if a tick takes
-   * more than 200ms in real time.
-   */
-  void startWatchdog();
-
   // Network::ConnectionHandler
   uint64_t numConnections() override { return num_connections_; }
 
   void addListener(Network::FilterChainFactory& factory, Network::ListenSocket& socket,
-                   bool bind_to_port, bool use_proxy_proto, bool use_orig_dst) override;
+                   Stats::Scope& scope, const Network::ListenerOptions& listener_options) override;
 
   void addSslListener(Network::FilterChainFactory& factory, Ssl::ServerContext& ssl_ctx,
-                      Network::ListenSocket& socket, bool bind_to_port, bool use_proxy_proto,
-                      bool use_orig_dst) override;
+                      Network::ListenSocket& socket, Stats::Scope& scope,
+                      const Network::ListenerOptions& listener_options) override;
 
-  Network::Listener* findListener(const std::string& socket_name) override;
+  Network::Listener* findListenerByAddress(const Network::Address::Instance& address) override;
 
   void closeListeners() override;
 
@@ -73,11 +67,11 @@ private:
    */
   struct ActiveListener : public Network::ListenerCallbacks {
     ActiveListener(ConnectionHandlerImpl& parent, Network::ListenSocket& socket,
-                   Network::FilterChainFactory& factory, bool use_proxy_proto, bool bind_to_port,
-                   bool use_orig_dst);
+                   Network::FilterChainFactory& factory, Stats::Scope& scope,
+                   const Network::ListenerOptions& listener_options);
 
     ActiveListener(ConnectionHandlerImpl& parent, Network::ListenerPtr&& listener,
-                   Network::FilterChainFactory& factory, const std::string& stats_prefix);
+                   Network::FilterChainFactory& factory, Stats::Scope& scope);
 
     /**
      * Fires when a new connection is received from the listener.
@@ -94,7 +88,7 @@ private:
   struct SslActiveListener : public ActiveListener {
     SslActiveListener(ConnectionHandlerImpl& parent, Ssl::ServerContext& ssl_ctx,
                       Network::ListenSocket& socket, Network::FilterChainFactory& factory,
-                      bool use_proxy_proto, bool bind_to_port, bool use_orig_dst);
+                      Stats::Scope& scope, const Network::ListenerOptions& listener_options);
   };
 
   typedef std::unique_ptr<ActiveListener> ActiveListenerPtr;
@@ -132,19 +126,14 @@ private:
    */
   void removeConnection(ActiveConnection& connection);
 
-  static ListenerStats generateStats(const std::string& prefix, Stats::Store& store);
+  static ListenerStats generateStats(Stats::Scope& scope);
 
-  Stats::Store& stats_store_;
   spdlog::logger& logger_;
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
-  std::map<std::string, ActiveListenerPtr> listeners_;
+  std::list<std::pair<Network::Address::InstanceConstSharedPtr, ActiveListenerPtr>> listeners_;
   std::list<ActiveConnectionPtr> connections_;
   std::atomic<uint64_t> num_connections_{};
-  Stats::Counter& watchdog_miss_counter_;
-  Stats::Counter& watchdog_mega_miss_counter_;
-  Event::TimerPtr watchdog_timer_;
-  SystemTime last_watchdog_time_;
 };
 
 typedef std::unique_ptr<ConnectionHandlerImpl> ConnectionHandlerImplPtr;

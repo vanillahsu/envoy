@@ -19,6 +19,7 @@ include_directories(${PROJECT_SOURCE_DIR})
 include_directories(${PROJECT_BINARY_DIR})
 include_directories(SYSTEM ${ENVOY_OPENSSL_INCLUDE_DIR})
 include_directories(${ENVOY_NGHTTP2_INCLUDE_DIR})
+include_directories(SYSTEM ${ENVOY_CARES_INCLUDE_DIR})
 include_directories(SYSTEM ${ENVOY_LIGHTSTEP_TRACER_INCLUDE_DIR})
 include_directories(${ENVOY_LIBEVENT_INCLUDE_DIR})
 
@@ -36,6 +37,7 @@ add_executable(envoy-test
   common/event/file_event_impl_test.cc
   common/filesystem/filesystem_impl_test.cc
   common/filesystem/watcher_impl_test.cc
+  common/grpc/codec_test.cc
   common/grpc/common_test.cc
   common/grpc/http1_bridge_filter_test.cc
   common/grpc/rpc_channel_impl_test.cc
@@ -69,6 +71,8 @@ add_executable(envoy-test
   common/mongo/codec_impl_test.cc
   common/mongo/proxy_test.cc
   common/mongo/utility_test.cc
+  common/network/address_impl_test.cc
+  common/network/cidr_range_test.cc
   common/network/connection_impl_test.cc
   common/network/dns_impl_test.cc
   common/network/filter_manager_impl_test.cc
@@ -78,9 +82,11 @@ add_executable(envoy-test
   common/network/utility_test.cc
   common/ratelimit/ratelimit_impl_test.cc
   common/redis/codec_impl_test.cc
+  common/redis/command_splitter_impl_test.cc
   common/redis/conn_pool_impl_test.cc
   common/redis/proxy_filter_test.cc
   common/router/config_impl_test.cc
+  common/router/rds_impl_test.cc
   common/router/retry_state_impl_test.cc
   common/router/router_test.cc
   common/router/router_ratelimit_test.cc
@@ -89,8 +95,11 @@ add_executable(envoy-test
   common/runtime/uuid_util_test.cc
   common/ssl/connection_impl_test.cc
   common/ssl/context_impl_test.cc
+  common/stats/stats_impl_test.cc
   common/stats/statsd_test.cc
+  common/stats/thread_local_store_test.cc
   common/tracing/http_tracer_impl_test.cc
+  common/upstream/cds_api_impl_test.cc
   common/upstream/cluster_manager_impl_test.cc
   common/upstream/health_checker_impl_test.cc
   common/upstream/host_utility_test.cc
@@ -99,6 +108,7 @@ add_executable(envoy-test
   common/upstream/logical_dns_cluster_test.cc
   common/upstream/outlier_detection_impl_test.cc
   common/upstream/resource_manager_impl_test.cc
+  common/upstream/ring_hash_lb_test.cc
   common/upstream/sds_test.cc
   common/upstream/upstream_impl_test.cc
   example_configs_test.cc
@@ -122,6 +132,7 @@ add_executable(envoy-test
   mocks/filesystem/mocks.cc
   mocks/grpc/mocks.cc
   mocks/http/mocks.cc
+  mocks/init/mocks.cc
   mocks/local_info/mocks.cc
   mocks/network/mocks.cc
   mocks/ratelimit/mocks.cc
@@ -134,16 +145,28 @@ add_executable(envoy-test
   mocks/thread_local/mocks.cc
   mocks/tracing/mocks.cc
   mocks/upstream/mocks.cc
+  server/config/http/config_test.cc
   server/config/network/config_test.cc
   server/config/network/http_connection_manager_test.cc
   server/configuration_impl_test.cc
   server/connection_handler_test.cc
   server/drain_manager_impl_test.cc
+  server/guarddog_impl_test.cc
   server/http/admin_test.cc
   server/http/health_check_test.cc
   server/options_impl_test.cc
+  server/server_test.cc
+  test_common/environment.cc
+  test_common/network_utility.cc
+  test_common/network_utility_test.cc
   test_common/printers.cc
   test_common/utility.cc)
+
+# The MOCK_METHOD* macros from gtest triggers this clang warning and it's hard
+# to work around, so we just ignore it.
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+  set_target_properties(envoy-test PROPERTIES COMPILE_FLAGS "-Wno-inconsistent-missing-override")
+endif()
 
 if (ENVOY_TCMALLOC)
   target_link_libraries(envoy-test tcmalloc_and_profiler)
@@ -156,6 +179,7 @@ target_link_libraries(envoy-test ssl)
 target_link_libraries(envoy-test crypto)
 target_link_libraries(envoy-test nghttp2)
 target_link_libraries(envoy-test lightstep_core_cxx11)
+target_link_libraries(envoy-test cares)
 target_link_libraries(envoy-test protobuf)
 target_link_libraries(envoy-test gmock)
 target_link_libraries(envoy-test pthread)
@@ -167,9 +191,12 @@ add_custom_target(
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
 )
 
+set(ENVOY_TEST_EXTRA_SETUP_SCRIPT "" CACHE STRING
+    "extra setup script to call from run_envoy_tests.sh after basic setup")
+
 add_custom_target(
   ${PROJECT_NAME}.check ${PROJECT_SOURCE_DIR}/test/run_envoy_tests.sh ${PROJECT_SOURCE_DIR}
-                        ${PROJECT_BINARY_DIR}
+                        ${PROJECT_BINARY_DIR} ${ENVOY_TEST_EXTRA_SETUP_SCRIPT}
   DEPENDS envoy envoy-test envoy.generate_example_configs
 )
 
@@ -179,6 +206,7 @@ add_custom_target(
   DEPENDS envoy envoy-test envoy.generate_example_configs
   COMMAND ${PROJECT_SOURCE_DIR}/test/run_envoy_coverage.sh ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}
           ${PROJECT_SOURCE_DIR} ${PROJECT_BINARY_DIR} ${ENVOY_GCOVR} ${ENVOY_GCOVR_EXTRA_ARGS}
+          ${ENVOY_TEST_EXTRA_SETUP_SCRIPT}
 )
 endif()
 

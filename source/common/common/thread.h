@@ -30,33 +30,12 @@ private:
 typedef std::unique_ptr<Thread> ThreadPtr;
 
 /**
- * This utility class wraps the common case of having a cross-thread "one shot" ready condition.
- */
-class ConditionalInitializer {
-public:
-  /**
-   * Set the conditional to ready, should only be called once.
-   */
-  void setReady();
-
-  /**
-   * Block until the conditional is ready, will return immediately if it is already ready.
-   *
-   */
-  void waitReady();
-
-private:
-  std::condition_variable cv_;
-  std::mutex mutex_;
-  bool ready_{false};
-};
-
-/**
  * Implementation of BasicLockable
  */
 class MutexBasicLockable : public BasicLockable {
 public:
   void lock() override { mutex_.lock(); }
+  bool try_lock() override { return mutex_.try_lock(); }
   void unlock() override { mutex_.unlock(); }
 
 private:

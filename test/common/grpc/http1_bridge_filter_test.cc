@@ -6,9 +6,11 @@
 #include "test/mocks/upstream/mocks.h"
 #include "test/test_common/utility.h"
 
+using testing::_;
 using testing::NiceMock;
 using testing::Return;
 using testing::ReturnPointee;
+using testing::ReturnRef;
 
 namespace Grpc {
 
@@ -27,6 +29,30 @@ public:
   Http::Protocol protocol_{Http::Protocol::Http11};
 };
 
+TEST_F(GrpcHttp1BridgeFilterTest, NoRoute) {
+  protocol_ = Http::Protocol::Http2;
+  ON_CALL(decoder_callbacks_, route()).WillByDefault(Return(nullptr));
+
+  Http::TestHeaderMapImpl request_headers{{"content-type", "application/grpc"},
+                                          {":path", "/lyft.users.BadCompanions/GetBadCompanions"}};
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, true));
+
+  Http::TestHeaderMapImpl response_headers{{":status", "404"}};
+}
+
+TEST_F(GrpcHttp1BridgeFilterTest, NoCluster) {
+  protocol_ = Http::Protocol::Http2;
+  ON_CALL(cm_, get(_)).WillByDefault(Return(nullptr));
+
+  Http::TestHeaderMapImpl request_headers{{"content-type", "application/grpc"},
+                                          {":path", "/lyft.users.BadCompanions/GetBadCompanions"}};
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, true));
+
+  Http::TestHeaderMapImpl response_headers{{":status", "404"}};
+}
+
 TEST_F(GrpcHttp1BridgeFilterTest, StatsHttp2HeaderOnlyResponse) {
   protocol_ = Http::Protocol::Http2;
 
@@ -37,10 +63,10 @@ TEST_F(GrpcHttp1BridgeFilterTest, StatsHttp2HeaderOnlyResponse) {
 
   Http::TestHeaderMapImpl response_headers{{":status", "200"}, {"grpc-status", "1"}};
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.encodeHeaders(response_headers, true));
-  EXPECT_EQ(1UL, cm_.cluster_.info_->stats_store_
+  EXPECT_EQ(1UL, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                      .counter("grpc.lyft.users.BadCompanions.GetBadCompanions.failure")
                      .value());
-  EXPECT_EQ(1UL, cm_.cluster_.info_->stats_store_
+  EXPECT_EQ(1UL, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                      .counter("grpc.lyft.users.BadCompanions.GetBadCompanions.total")
                      .value());
 }
@@ -59,10 +85,10 @@ TEST_F(GrpcHttp1BridgeFilterTest, StatsHttp2NormalResponse) {
   EXPECT_EQ(Http::FilterDataStatus::Continue, filter_.encodeData(data, false));
   Http::TestHeaderMapImpl response_trailers{{"grpc-status", "0"}};
   EXPECT_EQ(Http::FilterTrailersStatus::Continue, filter_.encodeTrailers(response_trailers));
-  EXPECT_EQ(1UL, cm_.cluster_.info_->stats_store_
+  EXPECT_EQ(1UL, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                      .counter("grpc.lyft.users.BadCompanions.GetBadCompanions.success")
                      .value());
-  EXPECT_EQ(1UL, cm_.cluster_.info_->stats_store_
+  EXPECT_EQ(1UL, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                      .counter("grpc.lyft.users.BadCompanions.GetBadCompanions.total")
                      .value());
 }
@@ -110,8 +136,8 @@ TEST_F(GrpcHttp1BridgeFilterTest, HandlingNormalResponse) {
   Http::TestHeaderMapImpl request_trailers{{"hello", "world"}};
   EXPECT_EQ(Http::FilterTrailersStatus::Continue, filter_.decodeTrailers(request_trailers));
 
-  Buffer::OwnedImpl buffer("hello");
-  ON_CALL(encoder_callbacks_, encodingBuffer()).WillByDefault(Return(&buffer));
+  Buffer::InstancePtr buffer(new Buffer::OwnedImpl("hello"));
+  ON_CALL(encoder_callbacks_, encodingBuffer()).WillByDefault(ReturnRef(buffer));
 
   Http::TestHeaderMapImpl response_headers{{":status", "200"}};
   EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,

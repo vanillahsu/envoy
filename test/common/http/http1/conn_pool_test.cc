@@ -1,6 +1,7 @@
 #include "common/buffer/buffer_impl.h"
 #include "common/http/codec_client.h"
 #include "common/http/http1/conn_pool.h"
+#include "common/network/utility.h"
 #include "common/upstream/upstream_impl.h"
 
 #include "test/common/http/common.h"
@@ -28,10 +29,13 @@ namespace Http1 {
  */
 class ConnPoolImplForTest : public ConnPoolImpl {
 public:
-  ConnPoolImplForTest(Event::MockDispatcher& dispatcher, Upstream::ClusterInfoPtr cluster)
-      : ConnPoolImpl(dispatcher, Upstream::HostPtr{new Upstream::HostImpl(
-                                     cluster, "tcp://127.0.0.1:9000", false, 1, "")},
-                     Upstream::ResourcePriority::Default),
+  ConnPoolImplForTest(Event::MockDispatcher& dispatcher,
+                      Upstream::ClusterInfoConstSharedPtr cluster)
+      : ConnPoolImpl(
+            dispatcher,
+            Upstream::HostSharedPtr{new Upstream::HostImpl(
+                cluster, "", Network::Utility::resolveUrl("tcp://127.0.0.1:9000"), false, 1, "")},
+            Upstream::ResourcePriority::Default),
         mock_dispatcher_(dispatcher) {}
 
   ~ConnPoolImplForTest() {
@@ -95,8 +99,8 @@ public:
 
   ~Http1ConnPoolImplTest() {
     // Make sure all gauges are 0.
-    for (Stats::Gauge& gauge : cluster_->stats_store_.gauges()) {
-      EXPECT_EQ(0U, gauge.value());
+    for (Stats::GaugeSharedPtr gauge : cluster_->stats_store_.gauges()) {
+      EXPECT_EQ(0U, gauge->value());
     }
   }
 
@@ -181,6 +185,24 @@ TEST_F(Http1ConnPoolImplTest, VerifyTimingStats) {
   r1.completeResponse(false);
 
   EXPECT_CALL(conn_pool_, onClientDestroy());
+  conn_pool_.test_clients_[0].connection_->raiseEvents(Network::ConnectionEvent::RemoteClose);
+  dispatcher_.clearDeferredDeleteList();
+}
+
+/**
+ * Test that buffer limits are set.
+ */
+TEST_F(Http1ConnPoolImplTest, VerifyBufferLimits) {
+  NiceMock<Http::MockStreamDecoder> outer_decoder;
+  ConnPoolCallbacks callbacks;
+  conn_pool_.expectClientCreate();
+  EXPECT_CALL(*cluster_, perConnectionBufferLimitBytes()).WillOnce(Return(8192));
+  EXPECT_CALL(*conn_pool_.test_clients_.back().connection_, setReadBufferLimit(8192));
+  Http::ConnectionPool::Cancellable* handle = conn_pool_.newStream(outer_decoder, callbacks);
+  EXPECT_NE(nullptr, handle);
+
+  EXPECT_CALL(conn_pool_, onClientDestroy());
+  EXPECT_CALL(callbacks.pool_failure_, ready());
   conn_pool_.test_clients_[0].connection_->raiseEvents(Network::ConnectionEvent::RemoteClose);
   dispatcher_.clearDeferredDeleteList();
 }

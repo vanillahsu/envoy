@@ -1,24 +1,34 @@
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ggdb3 -fno-omit-frame-pointer -Wall -Wextra -Werror -Wnon-virtual-dtor -Woverloaded-virtual -Wold-style-cast -std=c++0x")
 
+option(ENVOY_LIMIT_ERROR_LOG "limit the number of error log lines from compiler" OFF)
+if (ENVOY_LIMIT_ERROR_LOG)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fmax-errors=3")
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.9")
     message(FATAL_ERROR "gcc >= 4.9 required for regex support")
   endif()
 endif()
 
+option(ENVOY_DEBUG "build debug binaries" ON)
 option(ENVOY_CODE_COVERAGE "build with code coverage intrumentation" OFF)
+
 if (ENVOY_CODE_COVERAGE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage")
   add_definitions(-DCOVERAGE)
 endif()
 
-option(ENVOY_DEBUG "build debug binaries" ON)
-if (ENVOY_DEBUG)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0")
+if (ENVOY_DEBUG AND NOT ENVOY_CODE_COVERAGE)
   add_definitions(-DDEBUG)
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
   add_definitions(-DNDEBUG)
+endif()
+
+if (ENVOY_DEBUG OR ENVOY_CODE_COVERAGE)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 endif()
 
 option(ENVOY_SANITIZE "build with address sanitizer" OFF)
@@ -33,6 +43,15 @@ if (ENVOY_TCMALLOC)
 endif()
 
 option(ENVOY_STRIP "strip symbols from binaries" OFF)
+
+option(ENVOY_USE_CCACHE "build with ccache" OFF)
+if (ENVOY_USE_CCACHE)
+  find_program(CCACHE_FOUND ccache)
+  if (CCACHE_FOUND)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+  endif()
+endif()
 
 set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${ENVOY_COTIRE_MODULE_DIR}")
 include(cotire)

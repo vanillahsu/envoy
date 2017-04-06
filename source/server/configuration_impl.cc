@@ -1,4 +1,4 @@
-#include "configuration_impl.h"
+#include "server/configuration_impl.h"
 
 #include "envoy/network/connection.h"
 #include "envoy/runtime/runtime.h"
@@ -6,6 +6,7 @@
 #include "envoy/ssl/context_manager.h"
 
 #include "common/common/utility.h"
+#include "common/json/config_schemas.h"
 #include "common/ratelimit/ratelimit_impl.h"
 #include "common/ssl/context_config_impl.h"
 #include "common/tracing/http_tracer_impl.h"
@@ -14,13 +15,13 @@
 namespace Server {
 namespace Configuration {
 
-void FilterChainUtility::buildFilterChain(Network::FilterManager& filter_manager,
+bool FilterChainUtility::buildFilterChain(Network::FilterManager& filter_manager,
                                           const std::list<NetworkFilterFactoryCb>& factories) {
   for (const NetworkFilterFactoryCb& factory : factories) {
     factory(filter_manager);
   }
 
-  filter_manager.initializeReadFilters();
+  return filter_manager.initializeReadFilters();
 }
 
 MainImpl::MainImpl(Server::Instance& server) : server_(server) {}
@@ -54,6 +55,15 @@ void MainImpl::initialize(const Json::Object& json) {
   stats_flush_interval_ =
       std::chrono::milliseconds(json.getInteger("stats_flush_interval_ms", 5000));
 
+  watchdog_miss_timeout_ =
+      std::chrono::milliseconds(json.getInteger("watchdog_miss_timeout_ms", 200));
+  watchdog_megamiss_timeout_ =
+      std::chrono::milliseconds(json.getInteger("watchdog_megamiss_timeout_ms", 1000));
+  watchdog_kill_timeout_ =
+      std::chrono::milliseconds(json.getInteger("watchdog_kill_timeout_ms", 0));
+  watchdog_multikill_timeout_ =
+      std::chrono::milliseconds(json.getInteger("watchdog_multikill_timeout_ms", 0));
+
   if (json.hasObject("tracing")) {
     initializeTracers(*json.getObject("tracing"));
   } else {
@@ -77,58 +87,68 @@ void MainImpl::initialize(const Json::Object& json) {
 void MainImpl::initializeTracers(const Json::Object& tracing_configuration) {
   log().info("loading tracing configuration");
 
-  // Initialize http sinks
+  // Initialize tracing driver.
   if (tracing_configuration.hasObject("http")) {
-    http_tracer_.reset(new Tracing::HttpTracerImpl(server_.runtime(), server_.stats()));
-
     Json::ObjectPtr http_tracer_config = tracing_configuration.getObject("http");
+    Json::ObjectPtr driver = http_tracer_config->getObject("driver");
 
-    if (http_tracer_config->hasObject("sinks")) {
-      std::vector<Json::ObjectPtr> sinks = http_tracer_config->getObjectArray("sinks");
-      log().info(fmt::format("  loading {} http sink(s):", sinks.size()));
+    std::string type = driver->getString("type");
+    log().info(fmt::format("  loading tracing driver: {}", type));
 
-      for (const Json::ObjectPtr& sink : sinks) {
-        std::string type = sink->getString("type");
-        log().info(fmt::format("    loading {}", type));
+    if (type == "lightstep") {
+      ::Runtime::RandomGenerator& rand = server_.random();
+      Json::ObjectPtr lightstep_config = driver->getObject("config");
 
-        if (type == "lightstep") {
-          ::Runtime::RandomGenerator& rand = server_.random();
-          std::unique_ptr<lightstep::TracerOptions> opts(new lightstep::TracerOptions());
-          opts->access_token = server_.api().fileReadToEnd(sink->getString("access_token_file"));
-          StringUtil::rtrim(opts->access_token);
+      std::unique_ptr<lightstep::TracerOptions> opts(new lightstep::TracerOptions());
+      opts->access_token =
+          server_.api().fileReadToEnd(lightstep_config->getString("access_token_file"));
+      StringUtil::rtrim(opts->access_token);
 
-          opts->tracer_attributes["lightstep.component_name"] = server_.localInfo().clusterName();
-          opts->guid_generator = [&rand]() { return rand.random(); };
-
-          http_tracer_->addSink(Tracing::HttpSinkPtr{new Tracing::LightStepSink(
-              *sink->getObject("config"), *cluster_manager_, server_.stats(), server_.localInfo(),
-              server_.threadLocal(), server_.runtime(), std::move(opts))});
-        } else {
-          throw EnvoyException(fmt::format("unsupported sink type: '{}'", type));
-        }
+      if (server_.localInfo().clusterName().empty()) {
+        throw EnvoyException("cluster name must be defined if LightStep tracing is enabled. See "
+                             "--service-cluster option.");
       }
+      opts->tracer_attributes["lightstep.component_name"] = server_.localInfo().clusterName();
+      opts->guid_generator = [&rand]() { return rand.random(); };
+
+      Tracing::DriverPtr lightstep_driver(
+          new Tracing::LightStepDriver(*lightstep_config, *cluster_manager_, server_.stats(),
+                                       server_.threadLocal(), server_.runtime(), std::move(opts)));
+
+      http_tracer_.reset(
+          new Tracing::HttpTracerImpl(std::move(lightstep_driver), server_.localInfo()));
+    } else {
+      throw EnvoyException(fmt::format("unsupported driver type: '{}'", type));
     }
-  } else {
-    throw EnvoyException("incorrect tracing configuration");
   }
 }
 
 const std::list<Server::Configuration::ListenerPtr>& MainImpl::listeners() { return listeners_; }
 
-MainImpl::ListenerConfig::ListenerConfig(MainImpl& parent, Json::Object& json)
-    : parent_(parent), port_(json.getInteger("port")),
-      scope_(parent_.server_.stats(), fmt::format("listener.{}.", port_)) {
-  log().info("  port={}", port_);
+MainImpl::ListenerConfig::ListenerConfig(MainImpl& parent, Json::Object& json) : parent_(parent) {
+  address_ = Network::Utility::resolveUrl(json.getString("address"));
+
+  // ':' is a reserved char in statsd. Do the translation here to avoid costly inline translations
+  // later.
+  std::string final_stat_name = fmt::format("listener.{}.", address_->asString());
+  std::replace(final_stat_name.begin(), final_stat_name.end(), ':', '_');
+
+  scope_ = parent_.server_.stats().createScope(final_stat_name);
+  log().info("  address={}", address_->asString());
+
+  json.validateSchema(Json::Schema::LISTENER_SCHEMA);
 
   if (json.hasObject("ssl_context")) {
     Ssl::ContextConfigImpl context_config(*json.getObject("ssl_context"));
     ssl_context_ =
-        parent_.server_.sslContextManager().createSslServerContext(scope_, context_config);
+        parent_.server_.sslContextManager().createSslServerContext(*scope_, context_config);
   }
 
   bind_to_port_ = json.getBoolean("bind_to_port", true);
   use_proxy_proto_ = json.getBoolean("use_proxy_proto", false);
   use_original_dst_ = json.getBoolean("use_original_dst", false);
+  per_connection_buffer_limit_bytes_ =
+      json.getInteger("per_connection_buffer_limit_bytes", 1024 * 1024);
 
   std::vector<Json::ObjectPtr> filters = json.getObjectArray("filters");
   for (size_t i = 0; i < filters.size(); i++) {
@@ -170,14 +190,15 @@ MainImpl::ListenerConfig::ListenerConfig(MainImpl& parent, Json::Object& json)
   }
 }
 
-void MainImpl::ListenerConfig::createFilterChain(Network::Connection& connection) {
-  FilterChainUtility::buildFilterChain(connection, filter_factories_);
+bool MainImpl::ListenerConfig::createFilterChain(Network::Connection& connection) {
+  return FilterChainUtility::buildFilterChain(connection, filter_factories_);
 }
 
 InitialImpl::InitialImpl(const Json::Object& json) {
   Json::ObjectPtr admin = json.getObject("admin");
   admin_.access_log_path_ = admin->getString("access_log_path");
-  admin_.port_ = admin->getInteger("port");
+  admin_.profile_path_ = admin->getString("profile_path", "/var/log/envoy/envoy.prof");
+  admin_.address_ = Network::Utility::resolveUrl(admin->getString("address"));
 
   if (json.hasObject("flags_path")) {
     flags_path_.value(json.getString("flags_path"));

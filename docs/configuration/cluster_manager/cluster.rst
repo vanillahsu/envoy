@@ -9,6 +9,7 @@ Cluster
     "name": "...",
     "type": "...",
     "connect_timeout_ms": "...",
+    "per_connection_buffer_limit_bytes": "...",
     "lb_type": "...",
     "hosts": [],
     "service_name": "...",
@@ -27,6 +28,9 @@ Cluster
 name
   *(required, string)* Supplies the name of the cluster which must be unique across all clusters.
   The cluster name is used when emitting :ref:`statistics <config_cluster_manager_cluster_stats>`.
+  The cluster name can be at most 60 characters long, and must **not** contain ``:``.
+
+.. _config_cluster_manager_type:
 
 type
   *(required, string)* The :ref:`service discovery type <arch_overview_service_discovery_types>` to
@@ -37,10 +41,14 @@ connect_timeout_ms
   *(required, integer)* The timeout for new network connections to hosts in the cluster specified
   in milliseconds.
 
+per_connection_buffer_limit_bytes
+  *(optional, integer)* Soft limit on size of the cluster's connections read and write buffers.
+  If unspecified, an implementation defined default is applied (1MiB).
+
 lb_type
   *(required, string)* The :ref:`load balancer type <arch_overview_load_balancing_types>` to use
-  when picking a host in the cluster. Possible options are *round_robin*, *least_request*, and
-  *random*.
+  when picking a host in the cluster. Possible options are *round_robin*, *least_request*,
+  *ring_hash*, and *random*.
 
 hosts
   *(sometimes required, array)* If the service discovery type is *static*, *strict_dns*, or
@@ -138,9 +146,61 @@ dns_refresh_rate_ms
 
 outlier_detection
   *(optional, object)* If specified, outlier detection will be enabled for this upstream cluster.
-  Currently the presence of the empty object enables it and there are no options. See the
-  :ref:`architecture overview <arch_overview_outlier_detection>` for more information on outlier
-  detection.
+  See the :ref:`architecture overview <arch_overview_outlier_detection>` for more information on outlier
+  detection. The following configuration values are supported:
+
+  .. _config_cluster_manager_cluster_outlier_detection_consecutive_5xx:
+
+  consecutive_5xx
+    The number of consecutive 5xx responses before a consecutive 5xx ejection occurs. Defaults to 5.
+
+  .. _config_cluster_manager_cluster_outlier_detection_interval_ms:
+
+  interval_ms
+    The time interval between ejection analysis sweeps. This can result in both new ejections as well
+    as hosts being returned to service. Defaults to 10000ms or 10s.
+
+  .. _config_cluster_manager_cluster_outlier_detection_base_ejection_time_ms:
+
+  base_ejection_time_ms
+    The base time that a host is ejected for. The real time is equal to the base time multiplied by
+    the number of times the host has been ejected. Defaults to 30000ms or 30s.
+
+  .. _config_cluster_manager_cluster_outlier_detection_max_ejection_percent:
+
+  max_ejection_percent
+    The maximum % of an upstream cluster that can be ejected due to outlier detection. Defaults to 10%.
+
+  .. _config_cluster_manager_cluster_outlier_detection_enforcing_consecutive_5xx:
+
+  enforcing_consecutive_5xx
+    The % chance that a host will be actually ejected when an outlier status is detected through
+    consecutive 5xx. This setting can be used to disable ejection or to ramp it up slowly. Defaults to 100.
+
+  .. _config_cluster_manager_cluster_outlier_detection_enforcing_success_rate:
+
+  enforcing_success_rate
+    The % chance that a host will be actually ejected when an outlier status is detected through
+    success rate statistics. This setting can be used to disable ejection or to ramp it up slowly.
+    Defaults to 100.
+
+  .. _config_cluster_manager_cluster_outlier_detection_success_rate_minimum_hosts:
+
+  success_rate_minimum_hosts
+    The number of hosts in a cluster that must have enough request volume to detect success rate outliers.
+    If the number of hosts is less than this setting, outlier detection via success rate statistics is not
+    performed for any host in the cluster. Defaults to 5.
+
+  .. _config_cluster_manager_cluster_outlier_detection_success_rate_request_volume:
+
+  success_rate_request_volume
+    The minimum number of total requests that must be collected in one interval
+    (as defined by :ref:`interval_ms <config_cluster_manager_cluster_outlier_detection_interval_ms>` above)
+    to include this host in success rate based outlier detection. If the volume is lower than this setting,
+    outlier detection via success rate statistics is not performed for that host. Defaults to 100.
+
+  Each of the above configuration values can be overridden via
+  :ref:`runtime values <config_cluster_manager_cluster_runtime_outlier_detection>`.
 
 .. toctree::
   :hidden:

@@ -1,7 +1,5 @@
 #pragma once
 
-#include "message_impl.h"
-
 #include "envoy/event/dispatcher.h"
 #include "envoy/http/async_client.h"
 #include "envoy/http/codec.h"
@@ -10,14 +8,17 @@
 #include "envoy/router/router.h"
 #include "envoy/router/router_ratelimit.h"
 #include "envoy/router/shadow_writer.h"
+#include "envoy/ssl/connection.h"
 
 #include "common/common/empty_string.h"
 #include "common/common/linked_object.h"
 #include "common/http/access_log/request_info_impl.h"
+#include "common/http/message_impl.h"
 #include "common/router/router.h"
 
 namespace Http {
 
+class AsyncStreamImpl;
 class AsyncRequestImpl;
 
 class AsyncClientImpl final : public AsyncClient {
@@ -32,12 +33,16 @@ public:
   Request* send(MessagePtr&& request, Callbacks& callbacks,
                 const Optional<std::chrono::milliseconds>& timeout) override;
 
+  Stream* start(StreamCallbacks& callbacks,
+                const Optional<std::chrono::milliseconds>& timeout) override;
+
 private:
   const Upstream::ClusterInfo& cluster_;
   Router::FilterConfig config_;
   Event::Dispatcher& dispatcher_;
-  std::list<std::unique_ptr<AsyncRequestImpl>> active_requests_;
+  std::list<std::unique_ptr<AsyncStreamImpl>> active_streams_;
 
+  friend class AsyncStreamImpl;
   friend class AsyncRequestImpl;
 };
 
@@ -45,24 +50,31 @@ private:
  * Implementation of AsyncRequest. This implementation is capable of sending HTTP requests to a
  * ConnectionPool asynchronously.
  */
-class AsyncRequestImpl final : public AsyncClient::Request,
-                               StreamDecoderFilterCallbacks,
-                               Router::StableRouteTable,
-                               Logger::Loggable<Logger::Id::http>,
-                               LinkedObject<AsyncRequestImpl> {
+class AsyncStreamImpl : public AsyncClient::Stream,
+                        public StreamDecoderFilterCallbacks,
+                        Logger::Loggable<Logger::Id::http>,
+                        LinkedObject<AsyncStreamImpl> {
 public:
-  AsyncRequestImpl(MessagePtr&& request, AsyncClientImpl& parent, AsyncClient::Callbacks& callbacks,
-                   const Optional<std::chrono::milliseconds>& timeout);
-  ~AsyncRequestImpl();
+  AsyncStreamImpl(AsyncClientImpl& parent, AsyncClient::StreamCallbacks& callbacks,
+                  const Optional<std::chrono::milliseconds>& timeout);
+  virtual ~AsyncStreamImpl();
 
-  // Http::AsyncHttpRequest
-  void cancel() override;
+  // Http::AsyncClient::Stream
+  void sendHeaders(HeaderMap& headers, bool end_stream) override;
+  void sendData(Buffer::Instance& data, bool end_stream) override;
+  void sendTrailers(HeaderMap& trailers) override;
+  void reset() override;
+
+protected:
+  bool remoteClosed() { return remote_closed_; }
+
+  AsyncClientImpl& parent_;
 
 private:
   struct NullRateLimitPolicy : public Router::RateLimitPolicy {
     // Router::RateLimitPolicy
     const std::vector<std::reference_wrapper<const Router::RateLimitPolicyEntry>>&
-        getApplicableRateLimit(int64_t) const override {
+        getApplicableRateLimit(uint64_t) const override {
       return rate_limit_policy_entry_;
     }
 
@@ -98,6 +110,7 @@ private:
     // Router::RouteEntry
     const std::string& clusterName() const override { return cluster_name_; }
     void finalizeRequestHeaders(Http::HeaderMap&) const override {}
+    const Router::HashPolicy* hashPolicy() const override { return nullptr; }
     Upstream::ResourcePriority priority() const override {
       return Upstream::ResourcePriority::Default;
     }
@@ -114,12 +127,17 @@ private:
     const Router::VirtualCluster* virtualCluster(const Http::HeaderMap&) const override {
       return nullptr;
     }
+    const std::multimap<std::string, std::string>& opaqueConfig() const override {
+      return opaque_config_;
+    }
     const Router::VirtualHost& virtualHost() const override { return virtual_host_; }
+    bool autoHostRewrite() const override { return false; }
 
     static const NullRateLimitPolicy rate_limit_policy_;
     static const NullRetryPolicy retry_policy_;
     static const NullShadowPolicy shadow_policy_;
     static const NullVirtualHost virtual_host_;
+    static const std::multimap<std::string, std::string> opaque_config_;
 
     const std::string& cluster_name_;
     Optional<std::chrono::milliseconds> timeout_;
@@ -137,39 +155,68 @@ private:
   };
 
   void cleanup();
-  void failDueToClientDestroy();
-  void onComplete();
+  void closeLocal(bool end_stream);
+  void closeRemote(bool end_stream);
+  bool complete() { return local_closed_ && remote_closed_; }
 
   // Http::StreamDecoderFilterCallbacks
   void addResetStreamCallback(std::function<void()> callback) override {
     reset_callback_ = callback;
   }
   uint64_t connectionId() override { return 0; }
+  Ssl::Connection* ssl() override { return nullptr; }
   Event::Dispatcher& dispatcher() override { return parent_.dispatcher_; }
   void resetStream() override;
-  const Router::StableRouteTable& routeTable() { return *this; }
+  Router::RouteConstSharedPtr route() override { return route_; }
   uint64_t streamId() override { return stream_id_; }
   AccessLog::RequestInfo& requestInfo() override { return request_info_; }
   const std::string& downstreamAddress() override { return EMPTY_STRING; }
   void continueDecoding() override { NOT_IMPLEMENTED; }
-  const Buffer::Instance* decodingBuffer() override { return request_->body(); }
+  Buffer::InstancePtr& decodingBuffer() override {
+    throw EnvoyException("buffering is not supported in streaming");
+  }
   void encodeHeaders(HeaderMapPtr&& headers, bool end_stream) override;
   void encodeData(Buffer::Instance& data, bool end_stream) override;
   void encodeTrailers(HeaderMapPtr&& trailers) override;
 
-  // Router::StableRouteTable
-  const Router::Route* route(const Http::HeaderMap&) const override { return &route_; }
-
-  MessagePtr request_;
-  AsyncClientImpl& parent_;
-  AsyncClient::Callbacks& callbacks_;
+  AsyncClient::StreamCallbacks& stream_callbacks_;
   const uint64_t stream_id_;
-  std::unique_ptr<MessageImpl> response_;
   Router::ProdFilter router_;
   std::function<void()> reset_callback_;
   AccessLog::RequestInfoImpl request_info_;
-  RouteImpl route_;
-  bool complete_{};
+  std::shared_ptr<RouteImpl> route_;
+  bool local_closed_{};
+  bool remote_closed_{};
+
+  friend class AsyncClientImpl;
+};
+
+class AsyncRequestImpl final : public AsyncClient::Request,
+                               AsyncStreamImpl,
+                               AsyncClient::StreamCallbacks {
+public:
+  AsyncRequestImpl(MessagePtr&& request, AsyncClientImpl& parent, AsyncClient::Callbacks& callbacks,
+                   const Optional<std::chrono::milliseconds>& timeout);
+
+  // AsyncClient::Request
+  virtual void cancel() override;
+
+private:
+  void onComplete();
+
+  // AsyncClient::StreamCallbacks
+  void onHeaders(HeaderMapPtr&& headers, bool end_stream) override;
+  void onData(Buffer::Instance& data, bool end_stream) override;
+  void onTrailers(HeaderMapPtr&& trailers) override;
+  void onReset() override;
+
+  // Http::StreamDecoderFilterCallbacks
+  Buffer::InstancePtr& decodingBuffer() override { return request_->body(); }
+
+  MessagePtr request_;
+  AsyncClient::Callbacks& callbacks_;
+  std::unique_ptr<MessageImpl> response_;
+  bool cancelled_{};
 
   friend class AsyncClientImpl;
 };

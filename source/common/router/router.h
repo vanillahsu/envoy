@@ -19,6 +19,7 @@ namespace Router {
 // clang-format off
 #define ALL_ROUTER_STATS(COUNTER)                                                                  \
   COUNTER(no_route)                                                                                \
+  COUNTER(no_cluster)                                                                              \
   COUNTER(rq_redirect)                                                                             \
   COUNTER(rq_total)
 // clang-format on
@@ -92,7 +93,7 @@ private:
   ShadowWriterPtr shadow_writer_;
 };
 
-typedef std::shared_ptr<FilterConfig> FilterConfigPtr;
+typedef std::shared_ptr<FilterConfig> FilterConfigSharedPtr;
 
 /**
  * Service routing filter.
@@ -131,7 +132,7 @@ private:
     void setupPerTryTimeout();
     void onPerTryTimeout();
 
-    void onUpstreamHostSelected(Upstream::HostDescriptionPtr host) {
+    void onUpstreamHostSelected(Upstream::HostDescriptionConstSharedPtr host) {
       upstream_host_ = host;
       parent_.callbacks_->requestInfo().onUpstreamHostSelected(host);
     }
@@ -146,9 +147,9 @@ private:
 
     // Http::ConnectionPool::Callbacks
     void onPoolFailure(Http::ConnectionPool::PoolFailureReason reason,
-                       Upstream::HostDescriptionPtr host) override;
+                       Upstream::HostDescriptionConstSharedPtr host) override;
     void onPoolReady(Http::StreamEncoder& request_encoder,
-                     Upstream::HostDescriptionPtr host) override;
+                     Upstream::HostDescriptionConstSharedPtr host) override;
 
     Filter& parent_;
     Http::ConnectionPool::Instance& conn_pool_;
@@ -157,7 +158,7 @@ private:
     Http::StreamEncoder* request_encoder_{};
     Optional<Http::StreamResetReason> deferred_reset_reason_;
     Buffer::InstancePtr buffered_request_body_;
-    Upstream::HostDescriptionPtr upstream_host_;
+    Upstream::HostDescriptionConstSharedPtr upstream_host_;
 
     bool calling_encode_headers_ : 1;
     bool upstream_canary_ : 1;
@@ -167,15 +168,24 @@ private:
 
   typedef std::unique_ptr<UpstreamRequest> UpstreamRequestPtr;
 
+  struct LoadBalancerContextImpl : public Upstream::LoadBalancerContext {
+    LoadBalancerContextImpl(const Optional<uint64_t>& hash) : hash_(hash) {}
+
+    // Upstream::LoadBalancerContext
+    const Optional<uint64_t>& hashKey() const override { return hash_; }
+
+    const Optional<uint64_t> hash_;
+  };
+
   enum class UpstreamResetType { Reset, GlobalTimeout, PerTryTimeout };
 
   Http::AccessLog::ResponseFlag
   streamResetReasonToResponseFlag(Http::StreamResetReason reset_reason);
 
-  static const std::string& upstreamZone(Upstream::HostDescriptionPtr upstream_host);
+  static const std::string& upstreamZone(Upstream::HostDescriptionConstSharedPtr upstream_host);
   void chargeUpstreamCode(const Http::HeaderMap& response_headers,
-                          Upstream::HostDescriptionPtr upstream_host);
-  void chargeUpstreamCode(Http::Code code, Upstream::HostDescriptionPtr upstream_host);
+                          Upstream::HostDescriptionConstSharedPtr upstream_host);
+  void chargeUpstreamCode(Http::Code code, Upstream::HostDescriptionConstSharedPtr upstream_host);
   void cleanup();
   virtual RetryStatePtr createRetryState(const RetryPolicy& policy,
                                          Http::HeaderMap& request_headers,
@@ -184,6 +194,7 @@ private:
                                          Event::Dispatcher& dispatcher,
                                          Upstream::ResourcePriority priority) PURE;
   Upstream::ResourcePriority finalPriority();
+  Http::ConnectionPool::Instance* getConnPool();
   void maybeDoShadowing();
   void onRequestComplete();
   void onResetStream();
@@ -200,17 +211,20 @@ private:
 
   FilterConfig& config_;
   Http::StreamDecoderFilterCallbacks* callbacks_{};
-  const RouteEntry* route_entry_;
-  Upstream::ClusterInfoPtr cluster_;
+  RouteConstSharedPtr route_;
+  const RouteEntry* route_entry_{};
+  Upstream::ClusterInfoConstSharedPtr cluster_;
   std::string alt_stat_prefix_;
   const VirtualCluster* request_vcluster_;
   Event::TimerPtr response_timeout_;
   FilterUtility::TimeoutData timeout_;
+  Http::Code timeout_response_code_ = Http::Code::GatewayTimeout;
   UpstreamRequestPtr upstream_request_;
   RetryStatePtr retry_state_;
   Http::HeaderMap* downstream_headers_{};
   Http::HeaderMap* downstream_trailers_{};
   SystemTime downstream_request_complete_time_;
+  std::unique_ptr<LoadBalancerContextImpl> lb_context_;
 
   bool downstream_response_started_ : 1;
   bool downstream_end_stream_ : 1;

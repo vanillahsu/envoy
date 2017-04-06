@@ -1,4 +1,4 @@
-#include "statsd.h"
+#include "common/stats/statsd.h"
 
 #include "envoy/common/exception.h"
 #include "envoy/event/dispatcher.h"
@@ -6,17 +6,18 @@
 
 #include "common/buffer/buffer_impl.h"
 #include "common/common/assert.h"
+#include "common/network/address_impl.h"
 #include "common/network/utility.h"
 
 namespace Stats {
 namespace Statsd {
 
 Writer::Writer(uint32_t port) {
-  Network::AddrInfoPtr resolved(Network::Utility::resolveTCP("", port));
-  fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+  Network::Address::InstanceConstSharedPtr address(new Network::Address::Ipv4Instance(port));
+  fd_ = address->socket(Network::Address::SocketType::Datagram);
   ASSERT(fd_ != -1);
 
-  int rc = connect(fd_, resolved->ai_addr, resolved->ai_addrlen);
+  int rc = address->connect(fd_);
   ASSERT(rc != -1);
   UNREFERENCED_PARAMETER(rc);
 }
@@ -69,9 +70,10 @@ TcpStatsdSink::TcpStatsdSink(const LocalInfo::LocalInfo& local_info,
         fmt::format("TCP statsd requires setting --service-cluster and --service-node"));
   }
 
-  tls.set(tls_slot_, [this](Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectPtr {
-    return ThreadLocal::ThreadLocalObjectPtr{new TlsSink(*this, dispatcher)};
-  });
+  tls.set(tls_slot_,
+          [this](Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+            return std::make_shared<TlsSink>(*this, dispatcher);
+          });
 }
 
 TcpStatsdSink::TlsSink::TlsSink(TcpStatsdSink& parent, Event::Dispatcher& dispatcher)

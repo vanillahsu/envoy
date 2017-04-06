@@ -9,6 +9,7 @@
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/ratelimit/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/mocks/tracing/mocks.h"
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/mocks.h"
 
@@ -32,14 +33,10 @@ public:
 
 class LocalMockFilter : public MockFilter {
 public:
-  LocalMockFilter(const Upstream::HostDescription* host) : host_(host) {}
   ~LocalMockFilter() {
     // Make sure the upstream host is still valid in the filter destructor.
-    callbacks_->upstreamHost()->url();
+    callbacks_->upstreamHost()->address();
   }
-
-private:
-  const Upstream::HostDescription* host_;
 };
 
 TEST_F(NetworkFilterManagerTest, All) {
@@ -48,19 +45,19 @@ TEST_F(NetworkFilterManagerTest, All) {
   Upstream::HostDescription* host_description(new NiceMock<Upstream::MockHostDescription>());
   MockReadFilter* read_filter(new MockReadFilter());
   MockWriteFilter* write_filter(new MockWriteFilter());
-  MockFilter* filter(new LocalMockFilter(host_description));
+  MockFilter* filter(new LocalMockFilter());
 
   NiceMock<MockConnection> connection;
   FilterManagerImpl manager(connection, *this);
-  manager.addReadFilter(ReadFilterPtr{read_filter});
-  manager.addWriteFilter(WriteFilterPtr{write_filter});
-  manager.addFilter(FilterPtr{filter});
+  manager.addReadFilter(ReadFilterSharedPtr{read_filter});
+  manager.addWriteFilter(WriteFilterSharedPtr{write_filter});
+  manager.addFilter(FilterSharedPtr{filter});
 
-  read_filter->callbacks_->upstreamHost(Upstream::HostDescriptionPtr{host_description});
+  read_filter->callbacks_->upstreamHost(Upstream::HostDescriptionConstSharedPtr{host_description});
   EXPECT_EQ(read_filter->callbacks_->upstreamHost(), filter->callbacks_->upstreamHost());
 
   EXPECT_CALL(*read_filter, onNewConnection()).WillOnce(Return(FilterStatus::StopIteration));
-  manager.initializeReadFilters();
+  EXPECT_EQ(manager.initializeReadFilters(), true);
 
   EXPECT_CALL(*filter, onNewConnection()).WillOnce(Return(FilterStatus::Continue));
   read_filter->callbacks_->continueReading();
@@ -114,40 +111,46 @@ TEST_F(NetworkFilterManagerTest, RateLimitAndTcpProxy) {
 
   Json::ObjectPtr rl_config_loader = Json::Factory::LoadFromString(rl_json);
 
-  RateLimit::TcpFilter::ConfigPtr rl_config(
+  RateLimit::TcpFilter::ConfigSharedPtr rl_config(
       new RateLimit::TcpFilter::Config(*rl_config_loader, stats_store, runtime));
   RateLimit::MockClient* rl_client = new RateLimit::MockClient();
-  manager.addReadFilter(ReadFilterPtr{
+  manager.addReadFilter(ReadFilterSharedPtr{
       new RateLimit::TcpFilter::Instance(rl_config, RateLimit::ClientPtr{rl_client})});
 
   std::string tcp_proxy_json = R"EOF(
     {
-      "cluster": "fake_cluster",
-      "stat_prefix": "name"
+      "stat_prefix": "name",
+      "route_config": {
+        "routes": [
+          {
+            "cluster": "fake_cluster"
+          }
+        ]
+      }
     }
     )EOF";
 
   Json::ObjectPtr tcp_proxy_config_loader = Json::Factory::LoadFromString(tcp_proxy_json);
-  ::Filter::TcpProxyConfigPtr tcp_proxy_config(
+  ::Filter::TcpProxyConfigSharedPtr tcp_proxy_config(
       new ::Filter::TcpProxyConfig(*tcp_proxy_config_loader, cm, stats_store));
-  manager.addReadFilter(ReadFilterPtr{new ::Filter::TcpProxy(tcp_proxy_config, cm)});
+  manager.addReadFilter(ReadFilterSharedPtr{new ::Filter::TcpProxy(tcp_proxy_config, cm)});
 
   RateLimit::RequestCallbacks* request_callbacks{};
-  EXPECT_CALL(
-      *rl_client,
-      limit(_, "foo",
-            testing::ContainerEq(std::vector<RateLimit::Descriptor>{{{{"hello", "world"}}}}), ""))
+  EXPECT_CALL(*rl_client, limit(_, "foo", testing::ContainerEq(std::vector<RateLimit::Descriptor>{
+                                              {{{"hello", "world"}}}}),
+                                Tracing::EMPTY_CONTEXT))
       .WillOnce(WithArgs<0>(Invoke([&](RateLimit::RequestCallbacks& callbacks)
                                        -> void { request_callbacks = &callbacks; })));
 
-  manager.initializeReadFilters();
+  EXPECT_EQ(manager.initializeReadFilters(), true);
 
   NiceMock<Network::MockClientConnection>* upstream_connection =
       new NiceMock<Network::MockClientConnection>();
   Upstream::MockHost::MockCreateConnectionData conn_info;
   conn_info.connection_ = upstream_connection;
-  conn_info.host_.reset(
-      new Upstream::HostImpl(cm.cluster_.info_, "tcp://127.0.0.1:80", false, 1, ""));
+  conn_info.host_.reset(new Upstream::HostImpl(cm.thread_local_cluster_.cluster_.info_, "",
+                                               Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1,
+                                               ""));
   EXPECT_CALL(cm, tcpConnForCluster_("fake_cluster")).WillOnce(Return(conn_info));
 
   request_callbacks->complete(RateLimit::LimitStatus::OK);

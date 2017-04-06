@@ -1,5 +1,7 @@
 #pragma once
 
+#include "test/mocks/upstream/cluster_info.h"
+
 #include "envoy/upstream/upstream.h"
 
 #include "common/stats/stats_impl.h"
@@ -15,6 +17,10 @@ public:
   MOCK_METHOD0(numEjections, uint32_t());
   MOCK_METHOD1(putHttpResponseCode, void(uint64_t code));
   MOCK_METHOD1(putResponseTime, void(std::chrono::milliseconds time));
+  MOCK_METHOD0(lastEjectionTime, const Optional<SystemTime>&());
+  MOCK_METHOD0(lastUnejectionTime, const Optional<SystemTime>&());
+  MOCK_CONST_METHOD0(successRate, double());
+  MOCK_METHOD1(successRate, void(double new_success_rate));
 };
 
 class MockEventLogger : public EventLogger {
@@ -22,8 +28,9 @@ public:
   MockEventLogger();
   ~MockEventLogger();
 
-  MOCK_METHOD2(logEject, void(HostDescriptionPtr host, EjectionType type));
-  MOCK_METHOD1(logUneject, void(HostDescriptionPtr host));
+  MOCK_METHOD4(logEject, void(HostDescriptionConstSharedPtr host, Detector& detector,
+                              EjectionType type, bool enforced));
+  MOCK_METHOD1(logUneject, void(HostDescriptionConstSharedPtr host));
 };
 
 class MockDetector : public Detector {
@@ -31,13 +38,15 @@ public:
   MockDetector();
   ~MockDetector();
 
-  void runCallbacks(HostPtr host) {
+  void runCallbacks(HostSharedPtr host) {
     for (ChangeStateCb cb : callbacks_) {
       cb(host);
     }
   }
 
   MOCK_METHOD1(addChangedStateCb, void(ChangeStateCb cb));
+  MOCK_CONST_METHOD0(successRateAverage, double());
+  MOCK_CONST_METHOD0(successRateEjectionThreshold, double());
 
   std::list<ChangeStateCb> callbacks_;
 };
@@ -49,15 +58,18 @@ public:
   MockHostDescription();
   ~MockHostDescription();
 
+  MOCK_CONST_METHOD0(address, Network::Address::InstanceConstSharedPtr());
   MOCK_CONST_METHOD0(canary, bool());
   MOCK_CONST_METHOD0(cluster, const ClusterInfo&());
   MOCK_CONST_METHOD0(outlierDetector, Outlier::DetectorHostSink&());
-  MOCK_CONST_METHOD0(url, const std::string&());
+  MOCK_CONST_METHOD0(hostname, const std::string&());
   MOCK_CONST_METHOD0(stats, HostStats&());
   MOCK_CONST_METHOD0(zone, const std::string&());
 
-  std::string url_{"tcp://10.0.0.1:443"};
+  std::string hostname_;
+  Network::Address::InstanceConstSharedPtr address_;
   testing::NiceMock<Outlier::MockDetectorHostSink> outlier_detector_;
+  testing::NiceMock<MockClusterInfo> cluster_;
   Stats::IsolatedStoreImpl stats_store_;
   HostStats stats_{ALL_HOST_STATS(POOL_COUNTER(stats_store_), POOL_GAUGE(stats_store_))};
 };
@@ -66,28 +78,42 @@ class MockHost : public Host {
 public:
   struct MockCreateConnectionData {
     Network::ClientConnection* connection_{};
-    ConstHostPtr host_;
+    HostConstSharedPtr host_;
   };
 
   MockHost();
   ~MockHost();
-
-  MOCK_CONST_METHOD0(cluster, const ClusterInfo&());
-  MOCK_CONST_METHOD0(url, const std::string&());
-  MOCK_CONST_METHOD0(counters, std::list<std::reference_wrapper<Stats::Counter>>());
-  MOCK_CONST_METHOD0(gauges, std::list<std::reference_wrapper<Stats::Gauge>>());
-  MOCK_CONST_METHOD0(healthy, bool());
-  MOCK_METHOD1(healthy, void(bool));
-  MOCK_CONST_METHOD0(stats, HostStats&());
-  MOCK_CONST_METHOD0(weight, uint32_t());
-  MOCK_METHOD1(weight, void(uint32_t new_weight));
 
   CreateConnectionData createConnection(Event::Dispatcher& dispatcher) const override {
     MockCreateConnectionData data = createConnection_(dispatcher);
     return {Network::ClientConnectionPtr{data.connection_}, data.host_};
   }
 
+  void setOutlierDetector(Outlier::DetectorHostSinkPtr&& outlier_detector) override {
+    setOutlierDetector_(outlier_detector);
+  }
+
+  MOCK_CONST_METHOD0(address, Network::Address::InstanceConstSharedPtr());
+  MOCK_CONST_METHOD0(canary, bool());
+  MOCK_CONST_METHOD0(cluster, const ClusterInfo&());
+  MOCK_CONST_METHOD0(counters, std::list<Stats::CounterSharedPtr>());
   MOCK_CONST_METHOD1(createConnection_, MockCreateConnectionData(Event::Dispatcher& dispatcher));
+  MOCK_CONST_METHOD0(gauges, std::list<Stats::GaugeSharedPtr>());
+  MOCK_METHOD1(healthFlagClear, void(HealthFlag flag));
+  MOCK_CONST_METHOD1(healthFlagGet, bool(HealthFlag flag));
+  MOCK_METHOD1(healthFlagSet, void(HealthFlag flag));
+  MOCK_CONST_METHOD0(healthy, bool());
+  MOCK_CONST_METHOD0(hostname, const std::string&());
+  MOCK_CONST_METHOD0(outlierDetector, Outlier::DetectorHostSink&());
+  MOCK_METHOD1(setOutlierDetector_, void(Outlier::DetectorHostSinkPtr& outlier_detector));
+  MOCK_CONST_METHOD0(stats, HostStats&());
+  MOCK_CONST_METHOD0(weight, uint32_t());
+  MOCK_METHOD1(weight, void(uint32_t new_weight));
+  MOCK_CONST_METHOD0(zone, const std::string&());
+
+  testing::NiceMock<MockClusterInfo> cluster_;
+  Stats::IsolatedStoreImpl stats_store_;
+  HostStats stats_{ALL_HOST_STATS(POOL_COUNTER(stats_store_), POOL_GAUGE(stats_store_))};
 };
 
 } // Upstream

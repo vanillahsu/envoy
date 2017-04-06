@@ -20,7 +20,7 @@ void MockRetryState::expectRetry() {
 MockRetryState::~MockRetryState() {}
 
 MockRateLimitPolicyEntry::MockRateLimitPolicyEntry() {
-  ON_CALL(*this, routeKey()).WillByDefault(ReturnRef(route_key_));
+  ON_CALL(*this, disableKey()).WillByDefault(ReturnRef(disable_key_));
 }
 
 MockRateLimitPolicyEntry::~MockRateLimitPolicyEntry() {}
@@ -41,8 +41,12 @@ MockVirtualHost::MockVirtualHost() {
 
 MockVirtualHost::~MockVirtualHost() {}
 
+MockHashPolicy::MockHashPolicy() {}
+MockHashPolicy::~MockHashPolicy() {}
+
 MockRouteEntry::MockRouteEntry() {
   ON_CALL(*this, clusterName()).WillByDefault(ReturnRef(cluster_name_));
+  ON_CALL(*this, opaqueConfig()).WillByDefault(ReturnRef(opaque_config_));
   ON_CALL(*this, rateLimitPolicy()).WillByDefault(ReturnRef(rate_limit_policy_));
   ON_CALL(*this, retryPolicy()).WillByDefault(ReturnRef(retry_policy_));
   ON_CALL(*this, shadowPolicy()).WillByDefault(ReturnRef(shadow_policy_));
@@ -53,7 +57,8 @@ MockRouteEntry::MockRouteEntry() {
 
 MockRouteEntry::~MockRouteEntry() {}
 
-MockConfig::MockConfig() {
+MockConfig::MockConfig() : route_(new NiceMock<MockRoute>()) {
+  ON_CALL(*this, route(_, _)).WillByDefault(Return(route_));
   ON_CALL(*this, internalOnlyHeaders()).WillByDefault(ReturnRef(internal_only_headers_));
   ON_CALL(*this, responseHeadersToAdd()).WillByDefault(ReturnRef(response_headers_to_add_));
   ON_CALL(*this, responseHeadersToRemove()).WillByDefault(ReturnRef(response_headers_to_remove_));
@@ -63,11 +68,5 @@ MockConfig::~MockConfig() {}
 
 MockRoute::MockRoute() { ON_CALL(*this, routeEntry()).WillByDefault(Return(&route_entry_)); }
 MockRoute::~MockRoute() {}
-
-MockStableRouteTable::MockStableRouteTable() {
-  ON_CALL(*this, route(_)).WillByDefault(Return(&route_));
-}
-
-MockStableRouteTable::~MockStableRouteTable() {}
 
 } // Router

@@ -1,11 +1,10 @@
-#include "conn_manager_impl.h"
-#include "conn_manager_utility.h"
-#include "headers.h"
+#include "common/http/conn_manager_impl.h"
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
 #include "envoy/network/drain_decision.h"
+#include "envoy/ssl/connection.h"
 #include "envoy/stats/stats.h"
 #include "envoy/tracing/http_tracer.h"
 
@@ -14,8 +13,10 @@
 #include "common/common/enum_to_int.h"
 #include "common/common/utility.h"
 #include "common/http/codes.h"
+#include "common/http/conn_manager_utility.h"
 #include "common/http/exception.h"
 #include "common/http/header_map_impl.h"
+#include "common/http/headers.h"
 #include "common/http/http1/codec_impl.h"
 #include "common/http/http2/codec_impl.h"
 #include "common/http/utility.h"
@@ -30,6 +31,11 @@ ConnectionManagerStats ConnectionManagerImpl::generateStats(const std::string& p
                                POOL_TIMER_PREFIX(stats, prefix))},
       prefix,
       stats};
+}
+
+ConnectionManagerTracingStats ConnectionManagerImpl::generateTracingStats(const std::string& prefix,
+                                                                          Stats::Store& stats) {
+  return {CONN_MAN_TRACING_STATS(POOL_COUNTER_PREFIX(stats, prefix + "tracing."))};
 }
 
 ConnectionManagerImpl::ConnectionManagerImpl(ConnectionManagerConfig& config,
@@ -259,10 +265,32 @@ void ConnectionManagerImpl::onDrainTimeout() {
   checkForDeferredClose();
 }
 
+void ConnectionManagerImpl::chargeTracingStats(const Tracing::Reason& tracing_reason,
+                                               ConnectionManagerTracingStats& tracing_stats) {
+  switch (tracing_reason) {
+  case Tracing::Reason::ClientForced:
+    tracing_stats.client_enabled_.inc();
+    break;
+  case Tracing::Reason::NotTraceableRequestId:
+    tracing_stats.not_traceable_.inc();
+    break;
+  case Tracing::Reason::Sampling:
+    tracing_stats.random_sampling_.inc();
+    break;
+  case Tracing::Reason::ServiceForced:
+    tracing_stats.service_forced_.inc();
+    break;
+  default:
+    throw std::invalid_argument(
+        fmt::format("invalid tracing reason, value: {}", static_cast<int32_t>(tracing_reason)));
+  }
+}
+
 ConnectionManagerImpl::ActiveStream::ActiveStream(ConnectionManagerImpl& connection_manager)
     : connection_manager_(connection_manager),
-      stream_id_(ConnectionManagerUtility::generateStreamId(
-          connection_manager.config_.routeConfig(), connection_manager.random_generator_)),
+      snapped_route_config_(connection_manager.config_.routeConfigProvider().config()),
+      stream_id_(ConnectionManagerUtility::generateStreamId(*snapped_route_config_,
+                                                            connection_manager.random_generator_)),
       request_timer_(connection_manager_.stats_.named_.downstream_rq_time_.allocateSpan()),
       request_info_(connection_manager_.codec_->protocol()) {
   connection_manager_.stats_.named_.downstream_rq_total_.inc();
@@ -276,32 +304,45 @@ ConnectionManagerImpl::ActiveStream::ActiveStream(ConnectionManagerImpl& connect
 
 ConnectionManagerImpl::ActiveStream::~ActiveStream() {
   connection_manager_.stats_.named_.downstream_rq_active_.dec();
-  for (AccessLog::InstancePtr access_log : connection_manager_.config_.accessLogs()) {
+  for (AccessLog::InstanceSharedPtr access_log : connection_manager_.config_.accessLogs()) {
     access_log->log(request_headers_.get(), response_headers_.get(), request_info_);
   }
+  for (const auto& log_handler : access_log_handlers_) {
+    log_handler->log(request_headers_.get(), response_headers_.get(), request_info_);
+  }
 
-  if (ConnectionManagerUtility::shouldTraceRequest(request_info_,
-                                                   connection_manager_.config_.tracingConfig())) {
-    connection_manager_.tracer_.trace(request_headers_.get(), response_headers_.get(),
-                                      request_info_, *this);
+  if (active_span_) {
+    if (request_info_.healthCheck()) {
+      connection_manager_.config_.tracingStats().health_check_.inc();
+    } else {
+      Tracing::HttpTracerUtility::finalizeSpan(*active_span_, *request_headers_, request_info_,
+                                               *this);
+    }
   }
 }
 
-void ConnectionManagerImpl::ActiveStream::addStreamDecoderFilter(StreamDecoderFilterPtr filter) {
+void ConnectionManagerImpl::ActiveStream::addStreamDecoderFilter(
+    StreamDecoderFilterSharedPtr filter) {
   ActiveStreamDecoderFilterPtr wrapper(new ActiveStreamDecoderFilter(*this, filter));
   filter->setDecoderFilterCallbacks(*wrapper);
   wrapper->moveIntoListBack(std::move(wrapper), decoder_filters_);
 }
 
-void ConnectionManagerImpl::ActiveStream::addStreamEncoderFilter(StreamEncoderFilterPtr filter) {
+void ConnectionManagerImpl::ActiveStream::addStreamEncoderFilter(
+    StreamEncoderFilterSharedPtr filter) {
   ActiveStreamEncoderFilterPtr wrapper(new ActiveStreamEncoderFilter(*this, filter));
   filter->setEncoderFilterCallbacks(*wrapper);
   wrapper->moveIntoListBack(std::move(wrapper), encoder_filters_);
 }
 
-void ConnectionManagerImpl::ActiveStream::addStreamFilter(StreamFilterPtr filter) {
+void ConnectionManagerImpl::ActiveStream::addStreamFilter(StreamFilterSharedPtr filter) {
   addStreamDecoderFilter(filter);
   addStreamEncoderFilter(filter);
+}
+
+void ConnectionManagerImpl::ActiveStream::addAccessLogHandler(
+    Http::AccessLog::InstanceSharedPtr handler) {
+  access_log_handlers_.push_back(handler);
 }
 
 void ConnectionManagerImpl::ActiveStream::chargeStats(HeaderMap& headers) {
@@ -325,6 +366,10 @@ void ConnectionManagerImpl::ActiveStream::chargeStats(HeaderMap& headers) {
 
 uint64_t ConnectionManagerImpl::ActiveStream::connectionId() {
   return connection_manager_.read_callbacks_->connection().id();
+}
+
+Ssl::Connection* ConnectionManagerImpl::ActiveStream::ssl() {
+  return connection_manager_.read_callbacks_->connection().ssl();
 }
 
 void ConnectionManagerImpl::ActiveStream::decodeHeaders(HeaderMapPtr&& headers, bool end_stream) {
@@ -398,8 +443,20 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(HeaderMapPtr&& headers, 
 
   ConnectionManagerUtility::mutateRequestHeaders(
       *request_headers_, connection_manager_.read_callbacks_->connection(),
-      connection_manager_.config_, connection_manager_.random_generator_,
+      connection_manager_.config_, *snapped_route_config_, connection_manager_.random_generator_,
       connection_manager_.runtime_);
+
+  // Check if tracing is enabled at all.
+  if (connection_manager_.config_.tracingConfig()) {
+    Tracing::Decision tracing_decision =
+        Tracing::HttpTracerUtility::isTracing(request_info_, *request_headers_);
+    ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
+                                              connection_manager_.config_.tracingStats());
+
+    if (tracing_decision.is_tracing) {
+      active_span_ = connection_manager_.tracer_.startSpan(*this, *request_headers_, request_info_);
+    }
+  }
 
   // Set the trusted address for the connection by taking the last address in XFF.
   downstream_address_ = Utility::getLastAddressFromXFF(*request_headers_);
@@ -409,6 +466,7 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(HeaderMapPtr&& headers, 
 void ConnectionManagerImpl::ActiveStream::decodeHeaders(ActiveStreamDecoderFilter* filter,
                                                         HeaderMap& headers, bool end_stream) {
   std::list<ActiveStreamDecoderFilterPtr>::iterator entry;
+  std::list<ActiveStreamDecoderFilterPtr>::iterator continue_data_entry = decoder_filters_.end();
   if (!filter) {
     entry = decoder_filters_.begin();
   } else {
@@ -416,12 +474,27 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(ActiveStreamDecoderFilte
   }
 
   for (; entry != decoder_filters_.end(); entry++) {
-    FilterHeadersStatus status = (*entry)->handle_->decodeHeaders(headers, end_stream);
+    FilterHeadersStatus status = (*entry)->handle_->decodeHeaders(
+        headers, end_stream && continue_data_entry == decoder_filters_.end());
     stream_log_trace("decode headers called: filter={} status={}", *this,
                      static_cast<const void*>((*entry).get()), static_cast<uint64_t>(status));
     if (!(*entry)->commonHandleAfterHeadersCallback(status)) {
       return;
     }
+
+    // Here we handle the case where we have a header only request, but a filter adds a body
+    // to it. We need to not raise end_stream = true to further filters during inline iteration.
+    if (end_stream && buffered_request_data_ && continue_data_entry == decoder_filters_.end()) {
+      continue_data_entry = entry;
+    }
+  }
+
+  if (continue_data_entry != decoder_filters_.end()) {
+    // We use the continueDecoding() code since it will correctly handle not calling
+    // decodeHeaders() again. Fake setting stopped_ since the continueDecoding() code expects it.
+    ASSERT(buffered_request_data_);
+    (*continue_data_entry)->stopped_ = true;
+    (*continue_data_entry)->continueDecoding();
   }
 }
 
@@ -521,12 +594,21 @@ void ConnectionManagerImpl::startDrainSequence() {
 void ConnectionManagerImpl::ActiveStream::encodeHeaders(ActiveStreamEncoderFilter* filter,
                                                         HeaderMap& headers, bool end_stream) {
   std::list<ActiveStreamEncoderFilterPtr>::iterator entry = commonEncodePrefix(filter, end_stream);
+  std::list<ActiveStreamEncoderFilterPtr>::iterator continue_data_entry = encoder_filters_.end();
+
   for (; entry != encoder_filters_.end(); entry++) {
-    FilterHeadersStatus status = (*entry)->handle_->encodeHeaders(headers, end_stream);
+    FilterHeadersStatus status = (*entry)->handle_->encodeHeaders(
+        headers, end_stream && continue_data_entry == encoder_filters_.end());
     stream_log_trace("encode headers called: filter={} status={}", *this,
                      static_cast<const void*>((*entry).get()), static_cast<uint64_t>(status));
     if (!(*entry)->commonHandleAfterHeadersCallback(status)) {
       return;
+    }
+
+    // Here we handle the case where we have a header only response, but a filter adds a body
+    // to it. We need to not raise end_stream = true to further filters during inline iteration.
+    if (end_stream && buffered_response_data_ && continue_data_entry == encoder_filters_.end()) {
+      continue_data_entry = entry;
     }
   }
 
@@ -534,7 +616,7 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ActiveStreamEncoderFilte
   connection_manager_.config_.dateProvider().setDateHeader(headers);
   headers.insertServer().value(connection_manager_.config_.serverName());
   ConnectionManagerUtility::mutateResponseHeaders(headers, *request_headers_,
-                                                  connection_manager_.config_);
+                                                  *snapped_route_config_);
 
   // See if we want to drain/close the connection. Send the go away frame prior to encoding the
   // header block.
@@ -572,7 +654,8 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ActiveStreamEncoderFilte
 
   chargeStats(headers);
 
-  stream_log_debug("encoding headers via codec (end_stream={}):", *this, end_stream);
+  stream_log_debug("encoding headers via codec (end_stream={}):", *this,
+                   end_stream && continue_data_entry == encoder_filters_.end());
 #ifndef NDEBUG
   headers.iterate([](const HeaderEntry& header, void* context) -> void {
     stream_log_debug("  '{}':'{}'", *static_cast<ActiveStream*>(context), header.key().c_str(),
@@ -581,8 +664,18 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ActiveStreamEncoderFilte
 #endif
 
   // Now actually encode via the codec.
-  response_encoder_->encodeHeaders(headers, end_stream);
-  maybeEndEncode(end_stream);
+  response_encoder_->encodeHeaders(headers,
+                                   end_stream && continue_data_entry == encoder_filters_.end());
+
+  if (continue_data_entry != encoder_filters_.end()) {
+    // We use the continueEncoding() code since it will correctly handle not calling
+    // encodeHeaders() again. Fake setting stopped_ since the continueEncoding() code expects it.
+    ASSERT(buffered_response_data_);
+    (*continue_data_entry)->stopped_ = true;
+    (*continue_data_entry)->continueEncoding();
+  } else {
+    maybeEndEncode(end_stream);
+  }
 }
 
 void ConnectionManagerImpl::ActiveStream::encodeData(ActiveStreamEncoderFilter* filter,
@@ -652,8 +745,13 @@ void ConnectionManagerImpl::ActiveStream::onResetStream(StreamResetReason) {
       removeFromList(connection_manager_.streams_));
 }
 
-const std::string& ConnectionManagerImpl::ActiveStream::operationName() const {
-  return connection_manager_.config_.tracingConfig().value().operation_name_;
+Tracing::OperationName ConnectionManagerImpl::ActiveStream::operationName() const {
+  return connection_manager_.config_.tracingConfig()->operation_name_;
+}
+
+const std::vector<Http::LowerCaseString>&
+ConnectionManagerImpl::ActiveStream::requestHeadersForTags() const {
+  return connection_manager_.config_.tracingConfig()->request_headers_for_tags_;
 }
 
 void ConnectionManagerImpl::ActiveStreamFilterBase::addResetStreamCallback(
@@ -674,8 +772,8 @@ void ConnectionManagerImpl::ActiveStreamFilterBase::commonContinue() {
     doHeaders(complete() && !bufferedData() && !trailers());
   }
 
-  // TODO: If a filter returns StopIterationNoBuffer and then does a continue, we won't be able to
-  //       end the stream if there is no buffered data. Need to handle this.
+  // TODO(mattklein123): If a filter returns StopIterationNoBuffer and then does a continue, we
+  // won't be able to end the stream if there is no buffered data. Need to handle this.
   if (bufferedData()) {
     doData(complete() && !trailers());
   }
@@ -762,12 +860,23 @@ uint64_t ConnectionManagerImpl::ActiveStreamFilterBase::connectionId() {
   return parent_.connectionId();
 }
 
+Ssl::Connection* ConnectionManagerImpl::ActiveStreamFilterBase::ssl() { return parent_.ssl(); }
+
 Event::Dispatcher& ConnectionManagerImpl::ActiveStreamFilterBase::dispatcher() {
   return parent_.connection_manager_.read_callbacks_->connection().dispatcher();
 }
 
 AccessLog::RequestInfo& ConnectionManagerImpl::ActiveStreamFilterBase::requestInfo() {
   return parent_.request_info_;
+}
+
+Router::RouteConstSharedPtr ConnectionManagerImpl::ActiveStreamFilterBase::route() {
+  if (!parent_.cached_route_.valid()) {
+    parent_.cached_route_.value(
+        parent_.snapped_route_config_->route(*parent_.request_headers_, parent_.stream_id_));
+  }
+
+  return parent_.cached_route_.value();
 }
 
 void ConnectionManagerImpl::ActiveStreamDecoderFilter::continueDecoding() { commonContinue(); }

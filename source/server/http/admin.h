@@ -3,6 +3,7 @@
 #include "envoy/http/filter.h"
 #include "envoy/network/listen_socket.h"
 #include "envoy/server/admin.h"
+#include "envoy/upstream/outlier_detection.h"
 #include "envoy/upstream/resource_manager.h"
 
 #include "common/common/logger.h"
@@ -22,10 +23,12 @@ class AdminImpl : public Admin,
                   public Http::ConnectionManagerConfig,
                   Logger::Loggable<Logger::Id::admin> {
 public:
-  AdminImpl(const std::string& access_log_path, uint32_t port, Server::Instance& server);
+  AdminImpl(const std::string& access_log_path, const std::string& profiler_path,
+            Network::Address::InstanceConstSharedPtr address, Server::Instance& server);
 
   Http::Code runCallback(const std::string& path, Buffer::Instance& response);
-  Network::ListenSocket& socket() { return *socket_; }
+  const Network::ListenSocket& socket() override { return *socket_; }
+  Network::ListenSocket& mutable_socket() { return *socket_; }
 
   // Server::Admin
   void addHandler(const std::string& prefix, const std::string& help_text,
@@ -34,13 +37,15 @@ public:
   }
 
   // Network::FilterChainFactory
-  void createFilterChain(Network::Connection& connection) override;
+  bool createFilterChain(Network::Connection& connection) override;
 
   // Http::FilterChainFactory
   void createFilterChain(Http::FilterChainFactoryCallbacks& callbacks) override;
 
   // Http::ConnectionManagerConfig
-  const std::list<Http::AccessLog::InstancePtr>& accessLogs() override { return access_logs_; }
+  const std::list<Http::AccessLog::InstanceSharedPtr>& accessLogs() override {
+    return access_logs_;
+  }
   Http::ServerConnectionPtr createCodec(Network::Connection& connection,
                                         const Buffer::Instance& data,
                                         Http::ServerConnectionCallbacks& callbacks) override;
@@ -49,17 +54,16 @@ public:
   Http::FilterChainFactory& filterFactory() override { return *this; }
   bool generateRequestId() override { return false; }
   const Optional<std::chrono::milliseconds>& idleTimeout() override { return idle_timeout_; }
-  const Router::Config& routeConfig() override { return *route_config_; }
+  Router::RouteConfigProvider& routeConfigProvider() override { return route_config_provider_; }
   const std::string& serverName() override {
     return Server::Configuration::HttpConnectionManagerConfig::DEFAULT_SERVER_STRING;
   }
   Http::ConnectionManagerStats& stats() override { return stats_; }
+  Http::ConnectionManagerTracingStats& tracingStats() override { return tracing_stats_; }
   bool useRemoteAddress() override { return true; }
-  const std::string& localAddress() override;
+  const Network::Address::Instance& localAddress() override;
   const Optional<std::string>& userAgent() override { return user_agent_; }
-  const Optional<Http::TracingConnectionManagerConfig>& tracingConfig() override {
-    return tracing_config_;
-  }
+  const Http::TracingConnectionManagerConfig* tracingConfig() override { return nullptr; }
 
 private:
   /**
@@ -72,6 +76,18 @@ private:
   };
 
   /**
+   * Implementation of RouteConfigProvider that returns a static null route config.
+   */
+  struct NullRouteConfigProvider : public Router::RouteConfigProvider {
+    NullRouteConfigProvider();
+
+    // Router::RouteConfigProvider
+    Router::ConfigConstSharedPtr config() override { return config_; }
+
+    Router::ConfigConstSharedPtr config_;
+  };
+
+  /**
    * Attempt to change the log level of a logger or all loggers
    * @param params supplies the incoming endpoint query params.
    * @return TRUE if level change succeeded, FALSE otherwise.
@@ -79,6 +95,9 @@ private:
   bool changeLogLevel(const Http::Utility::QueryParams& params);
   void addCircuitSettings(const std::string& cluster_name, const std::string& priority_str,
                           Upstream::ResourceManager& resource_manager, Buffer::Instance& response);
+  void addOutlierInfo(const std::string& cluster_name,
+                      const Upstream::Outlier::Detector* outlier_detector,
+                      Buffer::Instance& response);
 
   /**
    * URL handlers.
@@ -96,14 +115,15 @@ private:
   Http::Code handlerQuitQuitQuit(const std::string& url, Buffer::Instance& response);
 
   Server::Instance& server_;
-  std::list<Http::AccessLog::InstancePtr> access_logs_;
+  std::list<Http::AccessLog::InstanceSharedPtr> access_logs_;
+  const std::string profile_path_;
   Network::ListenSocketPtr socket_;
   Http::ConnectionManagerStats stats_;
-  Router::ConfigPtr route_config_;
+  Http::ConnectionManagerTracingStats tracing_stats_;
+  NullRouteConfigProvider route_config_provider_;
   std::list<UrlHandler> handlers_;
   Optional<std::chrono::milliseconds> idle_timeout_;
   Optional<std::string> user_agent_;
-  Optional<Http::TracingConnectionManagerConfig> tracing_config_;
   Http::SlowDateProviderImpl date_provider_;
 };
 

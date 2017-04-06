@@ -75,6 +75,17 @@ public:
     }
     )EOF";
 
+  const std::string fault_with_target_cluster_json = R"EOF(
+    {
+      "delay" : {
+        "type" : "fixed",
+        "fixed_delay_percent" : 100,
+        "fixed_duration_ms" : 5000
+      },
+      "upstream_cluster" : "www1"
+    }
+    )EOF";
+
   void SetUpTest(const std::string json) {
     Json::ObjectPtr config = Json::Factory::LoadFromString(json);
     config_.reset(new FaultFilterConfig(*config, runtime_, "", stats_));
@@ -88,7 +99,7 @@ public:
     EXPECT_CALL(*timer_, disableTimer());
   }
 
-  FaultFilterConfigPtr config_;
+  FaultFilterConfigSharedPtr config_;
   std::unique_ptr<FaultFilter> filter_;
   NiceMock<MockStreamDecoderFilterCallbacks> filter_callbacks_;
   TestHeaderMapImpl request_headers_;
@@ -97,6 +108,18 @@ public:
   NiceMock<Runtime::MockLoader> runtime_;
   Event::MockTimer* timer_{};
 };
+
+TEST(FaultFilterBadConfigTest, EmptyConfig) {
+  const std::string json = R"EOF(
+  {
+  }
+  )EOF";
+
+  Stats::IsolatedStoreImpl stats;
+  Json::ObjectPtr config = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  EXPECT_THROW(FaultFilterConfig(*config, runtime, "", stats), EnvoyException);
+}
 
 TEST(FaultFilterBadConfigTest, BadAbortPercent) {
   const std::string json = R"EOF(
@@ -107,6 +130,7 @@ TEST(FaultFilterBadConfigTest, BadAbortPercent) {
       }
     }
   )EOF";
+
   Stats::IsolatedStoreImpl stats;
   Json::ObjectPtr config = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
@@ -121,6 +145,7 @@ TEST(FaultFilterBadConfigTest, MissingHTTPStatus) {
       }
     }
   )EOF";
+
   Stats::IsolatedStoreImpl stats;
   Json::ObjectPtr config = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
@@ -137,6 +162,7 @@ TEST(FaultFilterBadConfigTest, BadDelayType) {
       }
     }
   )EOF";
+
   Stats::IsolatedStoreImpl stats;
   Json::ObjectPtr config = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
@@ -153,6 +179,7 @@ TEST(FaultFilterBadConfigTest, BadDelayPercent) {
       }
     }
   )EOF";
+
   Stats::IsolatedStoreImpl stats;
   Json::ObjectPtr config = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
@@ -169,6 +196,7 @@ TEST(FaultFilterBadConfigTest, BadDelayDuration) {
       }
     }
    )EOF";
+
   Stats::IsolatedStoreImpl stats;
   Json::ObjectPtr config = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
@@ -184,6 +212,7 @@ TEST(FaultFilterBadConfigTest, MissingDelayDuration) {
       }
     }
    )EOF";
+
   Stats::IsolatedStoreImpl stats;
   Json::ObjectPtr config = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
@@ -433,6 +462,91 @@ TEST_F(FaultFilterTest, TimerResetAfterStreamReset) {
   EXPECT_EQ(FilterDataStatus::Continue, filter_->decodeData(data_, true));
 
   filter_callbacks_.reset_callback_();
+}
+
+TEST_F(FaultFilterTest, FaultWithTargetClusterMatchSuccess) {
+  SetUpTest(fault_with_target_cluster_json);
+  const std::string upstream_cluster("www1");
+
+  EXPECT_CALL(filter_callbacks_.route_->route_entry_, clusterName())
+      .WillOnce(ReturnRef(upstream_cluster));
+
+  // Delay related calls
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("fault.http.delay.fixed_delay_percent", 100))
+      .WillOnce(Return(true));
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("fault.http.delay.fixed_duration_ms", 5000))
+      .WillOnce(Return(5000UL));
+
+  SCOPED_TRACE("FaultWithTargetClusterMatchSuccess");
+  expectDelayTimer(5000UL);
+
+  EXPECT_CALL(filter_callbacks_.request_info_,
+              setResponseFlag(Http::AccessLog::ResponseFlag::DelayInjected));
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter_->decodeHeaders(request_headers_, false));
+
+  // Abort related calls
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("fault.http.abort.abort_percent", 0))
+      .WillOnce(Return(false));
+
+  // Delay only case
+  EXPECT_CALL(runtime_.snapshot_, getInteger("fault.http.abort.http_status", _)).Times(0);
+  EXPECT_CALL(filter_callbacks_, encodeHeaders_(_, _)).Times(0);
+  EXPECT_CALL(filter_callbacks_.request_info_,
+              setResponseFlag(Http::AccessLog::ResponseFlag::FaultInjected)).Times(0);
+  EXPECT_CALL(filter_callbacks_, continueDecoding());
+  timer_->callback_();
+
+  EXPECT_EQ(FilterDataStatus::Continue, filter_->decodeData(data_, false));
+  EXPECT_EQ(FilterTrailersStatus::Continue, filter_->decodeTrailers(request_headers_));
+
+  EXPECT_EQ(1UL, config_->stats().delays_injected_.value());
+  EXPECT_EQ(0UL, config_->stats().aborts_injected_.value());
+}
+
+TEST_F(FaultFilterTest, FaultWithTargetClusterMatchFail) {
+  SetUpTest(fault_with_target_cluster_json);
+  const std::string upstream_cluster("mismatch");
+
+  EXPECT_CALL(filter_callbacks_.route_->route_entry_, clusterName())
+      .WillOnce(ReturnRef(upstream_cluster));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("fault.http.delay.fixed_delay_percent", _))
+      .Times(0);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("fault.http.delay.fixed_duration_ms", _)).Times(0);
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("fault.http.abort.abort_percent", _)).Times(0);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("fault.http.abort.http_status", _)).Times(0);
+  EXPECT_CALL(filter_callbacks_, encodeHeaders_(_, _)).Times(0);
+  EXPECT_CALL(filter_callbacks_.request_info_, setResponseFlag(_)).Times(0);
+  EXPECT_CALL(filter_callbacks_, continueDecoding()).Times(0);
+
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers_, false));
+  EXPECT_EQ(FilterDataStatus::Continue, filter_->decodeData(data_, false));
+  EXPECT_EQ(FilterTrailersStatus::Continue, filter_->decodeTrailers(request_headers_));
+
+  EXPECT_EQ(0UL, config_->stats().delays_injected_.value());
+  EXPECT_EQ(0UL, config_->stats().aborts_injected_.value());
+}
+
+TEST_F(FaultFilterTest, FaultWithTargetClusterNullRoute) {
+  SetUpTest(fault_with_target_cluster_json);
+  const std::string upstream_cluster("www1");
+
+  EXPECT_CALL(*filter_callbacks_.route_, routeEntry()).WillOnce(Return(nullptr));
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("fault.http.delay.fixed_delay_percent", _))
+      .Times(0);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("fault.http.delay.fixed_duration_ms", _)).Times(0);
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("fault.http.abort.abort_percent", _)).Times(0);
+  EXPECT_CALL(runtime_.snapshot_, getInteger("fault.http.abort.http_status", _)).Times(0);
+  EXPECT_CALL(filter_callbacks_, encodeHeaders_(_, _)).Times(0);
+  EXPECT_CALL(filter_callbacks_.request_info_, setResponseFlag(_)).Times(0);
+  EXPECT_CALL(filter_callbacks_, continueDecoding()).Times(0);
+
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers_, false));
+  EXPECT_EQ(FilterDataStatus::Continue, filter_->decodeData(data_, false));
+  EXPECT_EQ(FilterTrailersStatus::Continue, filter_->decodeTrailers(request_headers_));
+
+  EXPECT_EQ(0UL, config_->stats().delays_injected_.value());
+  EXPECT_EQ(0UL, config_->stats().aborts_injected_.value());
 }
 
 } // Http

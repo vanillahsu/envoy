@@ -1,12 +1,11 @@
 #pragma once
 
-#include "libevent.h"
-
 #include "envoy/event/deferred_deletable.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/network/connection_handler.h"
 
 #include "common/common/logger.h"
+#include "common/event/libevent.h"
 
 namespace Event {
 
@@ -25,21 +24,23 @@ public:
 
   // Event::Dispatcher
   void clearDeferredDeleteList() override;
-  Network::ClientConnectionPtr createClientConnection(const std::string& url) override;
-  Network::ClientConnectionPtr createSslClientConnection(Ssl::ClientContext& ssl_ctx,
-                                                         const std::string& url) override;
+  Network::ClientConnectionPtr
+  createClientConnection(Network::Address::InstanceConstSharedPtr address) override;
+  Network::ClientConnectionPtr
+  createSslClientConnection(Ssl::ClientContext& ssl_ctx,
+                            Network::Address::InstanceConstSharedPtr address) override;
   Network::DnsResolverPtr createDnsResolver() override;
-  FileEventPtr createFileEvent(int fd, FileReadyCb cb) override;
+  FileEventPtr createFileEvent(int fd, FileReadyCb cb, FileTriggerType trigger,
+                               uint32_t events) override;
   Filesystem::WatcherPtr createFilesystemWatcher() override;
   Network::ListenerPtr createListener(Network::ConnectionHandler& conn_handler,
                                       Network::ListenSocket& socket, Network::ListenerCallbacks& cb,
-                                      Stats::Store& stats_store, bool bind_to_port,
-                                      bool use_proxy_proto, bool use_orig_dst) override;
+                                      Stats::Scope& scope,
+                                      const Network::ListenerOptions& listener_options) override;
   Network::ListenerPtr createSslListener(Network::ConnectionHandler& conn_handler,
                                          Ssl::ServerContext& ssl_ctx, Network::ListenSocket& socket,
-                                         Network::ListenerCallbacks& cb, Stats::Store& stats_store,
-                                         bool bind_to_port, bool use_proxy_proto,
-                                         bool use_orig_dst) override;
+                                         Network::ListenerCallbacks& cb, Stats::Scope& scope,
+                                         const Network::ListenerOptions& listener_options) override;
   TimerPtr createTimer(TimerCb cb) override;
   void deferredDelete(DeferredDeletablePtr&& to_delete) override;
   void exit() override;
@@ -52,6 +53,7 @@ private:
 
   Libevent::BasePtr base_;
   TimerPtr deferred_delete_timer_;
+  TimerPtr post_timer_;
   std::vector<DeferredDeletablePtr> to_delete_1_;
   std::vector<DeferredDeletablePtr> to_delete_2_;
   std::vector<DeferredDeletablePtr>* current_to_delete_;

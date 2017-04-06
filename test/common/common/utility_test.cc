@@ -21,6 +21,11 @@ TEST(DateUtil, All) {
   EXPECT_TRUE(DateUtil::timePointValid(std::chrono::system_clock::now()));
 }
 
+TEST(ProdSystemTimeSourceTest, All) {
+  ProdSystemTimeSource source;
+  source.currentSystemTime();
+}
+
 TEST(StringUtil, caseInsensitiveCompare) {
   EXPECT_EQ(0, StringUtil::caseInsensitiveCompare("CONTENT-LENGTH", "content-length"));
   EXPECT_LT(0, StringUtil::caseInsensitiveCompare("CONTENT-LENGTH", "blah"));
@@ -95,12 +100,14 @@ TEST(StringUtil, strlcpy) {
 }
 
 TEST(StringUtil, split) {
-  EXPECT_EQ(std::vector<std::string>{}, StringUtil::split("", ','));
-  EXPECT_EQ(std::vector<std::string>{"a"}, StringUtil::split("a", ','));
   EXPECT_EQ(std::vector<std::string>{"hello"}, StringUtil::split(",hello", ','));
-  EXPECT_EQ(std::vector<std::string>{"hello"}, StringUtil::split("hello,", ','));
-  EXPECT_EQ(std::vector<std::string>{}, StringUtil::split(",,", ','));
-  EXPECT_EQ((std::vector<std::string>{"hello", "world"}), StringUtil::split("hello,world", ','));
+  EXPECT_EQ(std::vector<std::string>{}, StringUtil::split("", ","));
+  EXPECT_EQ(std::vector<std::string>{"a"}, StringUtil::split("a", ","));
+  EXPECT_EQ(std::vector<std::string>{"hello"}, StringUtil::split("hello,", ","));
+  EXPECT_EQ(std::vector<std::string>{"hello"}, StringUtil::split(",hello", ","));
+  EXPECT_EQ(std::vector<std::string>{"hello"}, StringUtil::split("hello, ", ", "));
+  EXPECT_EQ(std::vector<std::string>{}, StringUtil::split(",,", ","));
+  EXPECT_EQ(std::vector<std::string>{"hello"}, StringUtil::split("hello", ""));
 }
 
 TEST(StringUtil, endsWith) {

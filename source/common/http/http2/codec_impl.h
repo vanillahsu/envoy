@@ -63,7 +63,8 @@ class ConnectionImpl : public virtual Connection, Logger::Loggable<Logger::Id::h
 public:
   ConnectionImpl(Network::Connection& connection, Stats::Scope& stats)
       : stats_{ALL_HTTP2_CODEC_STATS(POOL_COUNTER_PREFIX(stats, "http2."))},
-        connection_(connection) {}
+        connection_(connection), dispatching_(false), raised_goaway_(false),
+        pending_deferred_reset_(false) {}
 
   ~ConnectionImpl();
 
@@ -85,10 +86,24 @@ protected:
     Http2Callbacks();
     ~Http2Callbacks();
 
-    nghttp2_session_callbacks* callbacks() { return callbacks_; }
+    const nghttp2_session_callbacks* callbacks() { return callbacks_; }
 
   private:
     nghttp2_session_callbacks* callbacks_;
+  };
+
+  /**
+   * Wrapper for static nghttp2 session options.
+   */
+  class Http2Options {
+  public:
+    Http2Options();
+    ~Http2Options();
+
+    const nghttp2_option* options() { return options_; }
+
+  private:
+    nghttp2_option* options_;
   };
 
   /**
@@ -104,10 +119,10 @@ protected:
     ~StreamImpl();
 
     StreamImpl* base() { return this; }
-    ssize_t onDataSourceRead(size_t length, uint32_t* data_flags);
+    ssize_t onDataSourceRead(uint64_t length, uint32_t* data_flags);
     int onDataSourceSend(const uint8_t* framehd, size_t length);
     void resetStreamWorker(StreamResetReason reason);
-    void buildHeaders(std::vector<nghttp2_nv>& final_headers, const HeaderMap& headers);
+    static void buildHeaders(std::vector<nghttp2_nv>& final_headers, const HeaderMap& headers);
     void saveHeader(HeaderString&& name, HeaderString&& value);
     virtual void submitHeaders(const std::vector<nghttp2_nv>& final_headers,
                                nghttp2_data_provider* provider) PURE;
@@ -133,15 +148,16 @@ protected:
     HeaderMapImplPtr headers_;
     StreamDecoder* decoder_{};
     int32_t stream_id_{-1};
-    bool local_end_stream_{};
-    bool local_end_stream_sent_{};
-    bool remote_end_stream_{};
     Buffer::OwnedImpl pending_recv_data_;
     Buffer::OwnedImpl pending_send_data_;
-    bool data_deferred_{};
     HeaderMapPtr pending_trailers_;
     Optional<StreamResetReason> deferred_reset_;
     HeaderString cookies_;
+    bool local_end_stream_ : 1;
+    bool local_end_stream_sent_ : 1;
+    bool remote_end_stream_ : 1;
+    bool data_deferred_ : 1;
+    bool waiting_for_non_informational_headers_ : 1;
   };
 
   typedef std::unique_ptr<StreamImpl> StreamImplPtr;
@@ -175,6 +191,7 @@ protected:
   void sendSettings(uint64_t codec_options);
 
   static Http2Callbacks http2_callbacks_;
+  static Http2Options http2_options_;
 
   std::list<StreamImplPtr> active_streams_;
   nghttp2_session* session_{};
@@ -195,9 +212,12 @@ private:
   // needed.
   static const uint64_t DEFAULT_WINDOW_SIZE = 256 * 1024 * 1024;
 
+  static const std::unique_ptr<const Http::HeaderMap> CONTINUE_HEADER;
+
   Network::Connection& connection_;
-  bool dispatching_{};
-  bool raised_goaway_{};
+  bool dispatching_ : 1;
+  bool raised_goaway_ : 1;
+  bool pending_deferred_reset_ : 1;
 };
 
 /**

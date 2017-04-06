@@ -1,5 +1,4 @@
-#include "cluster_manager_impl.h"
-#include "load_balancer_impl.h"
+#include "common/upstream/cluster_manager_impl.h"
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/network/dns.h"
@@ -10,9 +9,131 @@
 #include "common/http/http1/conn_pool.h"
 #include "common/http/http2/conn_pool.h"
 #include "common/http/async_client_impl.h"
+#include "common/json/config_schemas.h"
 #include "common/router/shadow_writer_impl.h"
+#include "common/upstream/cds_api_impl.h"
+#include "common/upstream/load_balancer_impl.h"
+#include "common/upstream/ring_hash_lb.h"
 
 namespace Upstream {
+
+void ClusterManagerInitHelper::addCluster(Cluster& cluster) {
+  if (state_ == State::AllClustersInitialized) {
+    cluster.initialize();
+    return;
+  }
+
+  if (cluster.initializePhase() == Cluster::InitializePhase::Primary) {
+    primary_init_clusters_.push_back(&cluster);
+    cluster.initialize();
+  } else {
+    ASSERT(cluster.initializePhase() == Cluster::InitializePhase::Secondary);
+    secondary_init_clusters_.push_back(&cluster);
+    if (started_secondary_initialize_) {
+      // This can happen if we get a second CDS update that adds new clusters after we have
+      // already started secondary init. In this case, just immediately initialize.
+      cluster.initialize();
+    }
+  }
+
+  log().info("cm init: adding: cluster={} primary={} secondary={}", cluster.info()->name(),
+             primary_init_clusters_.size(), secondary_init_clusters_.size());
+  cluster.setInitializedCb([&cluster, this]() -> void {
+    ASSERT(state_ != State::AllClustersInitialized);
+    removeCluster(cluster);
+  });
+}
+
+void ClusterManagerInitHelper::removeCluster(Cluster& cluster) {
+  if (state_ == State::AllClustersInitialized) {
+    return;
+  }
+
+  // There is a remote edge case where we can remove a cluster via CDS that has not yet been
+  // initialized. When called via the remove cluster API this code catches that case.
+  std::list<Cluster*>* cluster_list;
+  if (cluster.initializePhase() == Cluster::InitializePhase::Primary) {
+    cluster_list = &primary_init_clusters_;
+  } else {
+    ASSERT(cluster.initializePhase() == Cluster::InitializePhase::Secondary);
+    cluster_list = &secondary_init_clusters_;
+  }
+
+  // It is possible that the cluster we are removing has already been initialized, and is not
+  // present in the initializer list. If so, this is fine.
+  cluster_list->remove(&cluster);
+  log().info("cm init: removing: cluster={} primary={} secondary={}", cluster.info()->name(),
+             primary_init_clusters_.size(), secondary_init_clusters_.size());
+  maybeFinishInitialize();
+}
+
+void ClusterManagerInitHelper::maybeFinishInitialize() {
+  // Do not do anything if we are still doing the initial static load or if we are waiting for
+  // CDS initialize.
+  if (state_ == State::Loading || state_ == State::WaitingForCdsInitialize) {
+    return;
+  }
+
+  // If we are still waiting for primary clusters to initialize, do nothing.
+  ASSERT(state_ == State::WaitingForStaticInitialize || state_ == State::CdsInitialized);
+  if (!primary_init_clusters_.empty()) {
+    return;
+  }
+
+  // If we are still waiting for secondary clusters to initialize, see if we need to first call
+  // initialize on them. This is only done once.
+  if (!secondary_init_clusters_.empty()) {
+    if (!started_secondary_initialize_) {
+      log().info("cm init: initializing secondary clusters");
+      started_secondary_initialize_ = true;
+      for (Cluster* cluster : secondary_init_clusters_) {
+        cluster->initialize();
+      }
+    }
+
+    return;
+  }
+
+  // At this point, if we are doing static init, and we have CDS, start CDS init. Otherwise, move
+  // directly to initialized.
+  started_secondary_initialize_ = false;
+  if (state_ == State::WaitingForStaticInitialize && cds_) {
+    log().info("cm init: initializing cds");
+    state_ = State::WaitingForCdsInitialize;
+    cds_->initialize();
+  } else {
+    state_ = State::AllClustersInitialized;
+    if (initialized_callback_) {
+      initialized_callback_();
+    }
+  }
+}
+
+void ClusterManagerInitHelper::onStaticLoadComplete() {
+  ASSERT(state_ == State::Loading);
+  state_ = State::WaitingForStaticInitialize;
+  maybeFinishInitialize();
+}
+
+void ClusterManagerInitHelper::setCds(CdsApi* cds) {
+  ASSERT(state_ == State::Loading);
+  cds_ = cds;
+  if (cds_) {
+    cds_->setInitializedCb([this]() -> void {
+      ASSERT(state_ == State::WaitingForCdsInitialize);
+      state_ = State::CdsInitialized;
+      maybeFinishInitialize();
+    });
+  }
+}
+
+void ClusterManagerInitHelper::setInitializedCb(std::function<void()> callback) {
+  if (state_ == State::AllClustersInitialized) {
+    callback();
+  } else {
+    initialized_callback_ = callback;
+  }
+}
 
 ClusterManagerImpl::ClusterManagerImpl(const Json::Object& config, ClusterManagerFactory& factory,
                                        Stats::Store& stats, ThreadLocal::Instance& tls,
@@ -20,10 +141,10 @@ ClusterManagerImpl::ClusterManagerImpl(const Json::Object& config, ClusterManage
                                        const LocalInfo::LocalInfo& local_info,
                                        AccessLog::AccessLogManager& log_manager)
     : factory_(factory), runtime_(runtime), stats_(stats), tls_(tls), random_(random),
-      thread_local_slot_(tls.allocateSlot()), local_info_(local_info) {
+      thread_local_slot_(tls.allocateSlot()), local_info_(local_info),
+      cm_stats_(generateStats(stats)) {
 
-  std::vector<Json::ObjectPtr> clusters = config.getObjectArray("clusters");
-  pending_cluster_init_ = clusters.size();
+  config.validateSchema(Json::Schema::CLUSTER_MANAGER_SCHEMA);
 
   if (config.hasObject("outlier_detection")) {
     std::string event_log_file_path =
@@ -35,7 +156,6 @@ ClusterManagerImpl::ClusterManagerImpl(const Json::Object& config, ClusterManage
   }
 
   if (config.hasObject("sds")) {
-    pending_cluster_init_++;
     loadCluster(*config.getObject("sds")->getObject("cluster"), false);
 
     SdsConfig sds_config{
@@ -45,7 +165,15 @@ ClusterManagerImpl::ClusterManagerImpl(const Json::Object& config, ClusterManage
     sds_config_.value(sds_config);
   }
 
-  for (const Json::ObjectPtr& cluster : clusters) {
+  if (config.hasObject("cds")) {
+    loadCluster(*config.getObject("cds")->getObject("cluster"), false);
+  }
+
+  // We can now potentially create the CDS API once the backing cluster exists.
+  cds_api_ = factory_.createCds(config, *this);
+  init_helper_.setCds(cds_api_.get());
+
+  for (const Json::ObjectPtr& cluster : config.getObjectArray("clusters")) {
     loadCluster(*cluster, false);
   }
 
@@ -60,16 +188,26 @@ ClusterManagerImpl::ClusterManagerImpl(const Json::Object& config, ClusterManage
 
   tls.set(thread_local_slot_,
           [this, local_cluster_name](Event::Dispatcher& dispatcher)
-              -> ThreadLocal::ThreadLocalObjectPtr {
-                return ThreadLocal::ThreadLocalObjectPtr{
+              -> ThreadLocal::ThreadLocalObjectSharedPtr {
+                return ThreadLocal::ThreadLocalObjectSharedPtr{
                     new ThreadLocalClusterManagerImpl(*this, dispatcher, local_cluster_name)};
               });
 
-  // To avoid threading issues, for those clusters that start with hosts already in them (like
-  // the static cluster), we need to post an update onto each thread to notify them of the update.
+  // To avoid threading issues, for those clusters that start with hosts already in them (like the
+  // static cluster), we need to post an update onto each thread to notify them of the update. We
+  // also require this for dynamic clusters where an immediate resolve occurred in the cluster
+  // constructor, prior to the member update callback being configured.
   for (auto& cluster : primary_clusters_) {
     postInitializeCluster(*cluster.second.cluster_);
   }
+
+  init_helper_.onStaticLoadComplete();
+}
+
+ClusterManagerStats ClusterManagerImpl::generateStats(Stats::Scope& scope) {
+  std::string final_prefix = "cluster_manager.";
+  return {ALL_CLUSTER_MANAGER_STATS(POOL_COUNTER_PREFIX(scope, final_prefix),
+                                    POOL_GAUGE_PREFIX(scope, final_prefix))};
 }
 
 void ClusterManagerImpl::postInitializeCluster(Cluster& cluster) {
@@ -77,13 +215,12 @@ void ClusterManagerImpl::postInitializeCluster(Cluster& cluster) {
     return;
   }
 
-  postThreadLocalClusterUpdate(cluster, cluster.hosts(), std::vector<HostPtr>{});
+  postThreadLocalClusterUpdate(cluster, cluster.hosts(), std::vector<HostSharedPtr>{});
 }
 
 bool ClusterManagerImpl::addOrUpdatePrimaryCluster(const Json::Object& new_config) {
   // First we need to see if this new config is new or an update to an existing dynamic cluster.
   // We don't allow updates to statically configured clusters in the main configuration.
-  // TODO: Stats
   std::string cluster_name = new_config.getString("name");
   auto existing_cluster = primary_clusters_.find(cluster_name);
   if (existing_cluster != primary_clusters_.end() &&
@@ -92,8 +229,12 @@ bool ClusterManagerImpl::addOrUpdatePrimaryCluster(const Json::Object& new_confi
     return false;
   }
 
+  if (existing_cluster != primary_clusters_.end()) {
+    init_helper_.removeCluster(*existing_cluster->second.cluster_);
+  }
+
   loadCluster(new_config, true);
-  ClusterInfoPtr new_cluster = primary_clusters_.at(cluster_name).cluster_->info();
+  ClusterInfoConstSharedPtr new_cluster = primary_clusters_.at(cluster_name).cluster_->info();
   tls_.runOnAllThreads([this, new_cluster]() -> void {
     ThreadLocalClusterManagerImpl& cluster_manager =
         tls_.getTyped<ThreadLocalClusterManagerImpl>(thread_local_slot_);
@@ -107,13 +248,15 @@ bool ClusterManagerImpl::addOrUpdatePrimaryCluster(const Json::Object& new_confi
 }
 
 bool ClusterManagerImpl::removePrimaryCluster(const std::string& cluster_name) {
-  // TODO: Stats
   auto existing_cluster = primary_clusters_.find(cluster_name);
   if (existing_cluster == primary_clusters_.end() || !existing_cluster->second.added_via_api_) {
     return false;
   }
 
-  primary_clusters_.erase(cluster_name);
+  init_helper_.removeCluster(*existing_cluster->second.cluster_);
+  primary_clusters_.erase(existing_cluster);
+  cm_stats_.cluster_removed_.inc();
+  cm_stats_.total_clusters_.set(primary_clusters_.size());
   tls_.runOnAllThreads([this, cluster_name]() -> void {
     ThreadLocalClusterManagerImpl& cluster_manager =
         tls_.getTyped<ThreadLocalClusterManagerImpl>(thread_local_slot_);
@@ -128,88 +271,75 @@ void ClusterManagerImpl::loadCluster(const Json::Object& cluster, bool added_via
   ClusterPtr new_cluster =
       factory_.clusterFromJson(cluster, *this, sds_config_, outlier_event_logger_);
 
+  init_helper_.addCluster(*new_cluster);
   if (!added_via_api) {
     if (primary_clusters_.find(new_cluster->info()->name()) != primary_clusters_.end()) {
       throw EnvoyException(
           fmt::format("cluster manager: duplicate cluster '{}'", new_cluster->info()->name()));
     }
-
-    if (new_cluster->initializePhase() == Cluster::InitializePhase::Primary) {
-      new_cluster->initialize();
-    } else {
-      ASSERT(new_cluster->initializePhase() == Cluster::InitializePhase::Secondary);
-      secondary_init_clusters_.push_back(new_cluster.get());
-    }
-
-    ASSERT(pending_cluster_init_ > 0);
-    new_cluster->setInitializedCb([this]() -> void {
-      ASSERT(pending_cluster_init_ > 0);
-      if (--pending_cluster_init_ == 0) {
-        if (initialized_callback_) {
-          initialized_callback_();
-        }
-      } else if (pending_cluster_init_ == secondary_init_clusters_.size()) {
-        // All primary clusters have initialized. Now we start up the secondary clusters.
-        for (Cluster* cluster : secondary_init_clusters_) {
-          cluster->initialize();
-        }
-      }
-    });
-  } else {
-    new_cluster->initialize();
   }
 
   const Cluster& primary_cluster_reference = *new_cluster;
-  new_cluster->addMemberUpdateCb([&primary_cluster_reference, this](
-      const std::vector<HostPtr>& hosts_added, const std::vector<HostPtr>& hosts_removed) {
-    // This fires when a cluster is about to have an updated member set. We need to send this
-    // out to all of the thread local configurations.
-    postThreadLocalClusterUpdate(primary_cluster_reference, hosts_added, hosts_removed);
-  });
+  new_cluster->addMemberUpdateCb(
+      [&primary_cluster_reference, this](const std::vector<HostSharedPtr>& hosts_added,
+                                         const std::vector<HostSharedPtr>& hosts_removed) {
+        // This fires when a cluster is about to have an updated member set. We need to send this
+        // out to all of the thread local configurations.
+        postThreadLocalClusterUpdate(primary_cluster_reference, hosts_added, hosts_removed);
+      });
 
   // emplace() will do nothing if the key already exists. Always erase first.
-  primary_clusters_.erase(primary_cluster_reference.info()->name());
+  size_t num_erased = primary_clusters_.erase(primary_cluster_reference.info()->name());
   primary_clusters_.emplace(
       primary_cluster_reference.info()->name(),
       PrimaryClusterData{cluster.hash(), added_via_api, std::move(new_cluster)});
+
+  cm_stats_.total_clusters_.set(primary_clusters_.size());
+  if (num_erased) {
+    cm_stats_.cluster_modified_.inc();
+  } else {
+    cm_stats_.cluster_added_.inc();
+  }
 }
 
-ClusterInfoPtr ClusterManagerImpl::get(const std::string& cluster) {
+ThreadLocalCluster* ClusterManagerImpl::get(const std::string& cluster) {
   ThreadLocalClusterManagerImpl& cluster_manager =
       tls_.getTyped<ThreadLocalClusterManagerImpl>(thread_local_slot_);
 
   auto entry = cluster_manager.thread_local_clusters_.find(cluster);
   if (entry != cluster_manager.thread_local_clusters_.end()) {
-    return entry->second->cluster_info_;
+    return entry->second.get();
   } else {
     return nullptr;
   }
 }
 
 Http::ConnectionPool::Instance*
-ClusterManagerImpl::httpConnPoolForCluster(const std::string& cluster, ResourcePriority priority) {
+ClusterManagerImpl::httpConnPoolForCluster(const std::string& cluster, ResourcePriority priority,
+                                           LoadBalancerContext* context) {
   ThreadLocalClusterManagerImpl& cluster_manager =
       tls_.getTyped<ThreadLocalClusterManagerImpl>(thread_local_slot_);
 
   // Select a host and create a connection pool for it if it does not already exist.
   auto entry = cluster_manager.thread_local_clusters_.find(cluster);
   if (entry == cluster_manager.thread_local_clusters_.end()) {
-    throw EnvoyException(fmt::format("unknown cluster '{}'", cluster));
+    return nullptr;
   }
 
-  return entry->second->connPool(priority);
+  return entry->second->connPool(priority, context);
 }
 
-void ClusterManagerImpl::postThreadLocalClusterUpdate(const Cluster& primary_cluster,
-                                                      const std::vector<HostPtr>& hosts_added,
-                                                      const std::vector<HostPtr>& hosts_removed) {
+void ClusterManagerImpl::postThreadLocalClusterUpdate(
+    const Cluster& primary_cluster, const std::vector<HostSharedPtr>& hosts_added,
+    const std::vector<HostSharedPtr>& hosts_removed) {
   const std::string& name = primary_cluster.info()->name();
-  ConstHostVectorPtr hosts_copy(new std::vector<HostPtr>(primary_cluster.hosts()));
-  ConstHostVectorPtr healthy_hosts_copy(new std::vector<HostPtr>(primary_cluster.healthyHosts()));
-  ConstHostListsPtr hosts_per_zone_copy(
-      new std::vector<std::vector<HostPtr>>(primary_cluster.hostsPerZone()));
-  ConstHostListsPtr healthy_hosts_per_zone_copy(
-      new std::vector<std::vector<HostPtr>>(primary_cluster.healthyHostsPerZone()));
+  HostVectorConstSharedPtr hosts_copy(new std::vector<HostSharedPtr>(primary_cluster.hosts()));
+  HostVectorConstSharedPtr healthy_hosts_copy(
+      new std::vector<HostSharedPtr>(primary_cluster.healthyHosts()));
+  HostListsConstSharedPtr hosts_per_zone_copy(
+      new std::vector<std::vector<HostSharedPtr>>(primary_cluster.hostsPerZone()));
+  HostListsConstSharedPtr healthy_hosts_per_zone_copy(
+      new std::vector<std::vector<HostSharedPtr>>(primary_cluster.healthyHostsPerZone()));
 
   tls_.runOnAllThreads([this, name, hosts_copy, healthy_hosts_copy, hosts_per_zone_copy,
                         healthy_hosts_per_zone_copy, hosts_added, hosts_removed]() -> void {
@@ -228,7 +358,7 @@ Host::CreateConnectionData ClusterManagerImpl::tcpConnForCluster(const std::stri
     throw EnvoyException(fmt::format("unknown cluster '{}'", cluster));
   }
 
-  ConstHostPtr logical_host = entry->second->lb_->chooseHost();
+  HostConstSharedPtr logical_host = entry->second->lb_->chooseHost(nullptr);
   if (logical_host) {
     return logical_host->createConnection(cluster_manager.thread_local_dispatcher_);
   } else {
@@ -274,8 +404,23 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ThreadLocalClusterManagerImpl
   }
 }
 
+ClusterManagerImpl::ThreadLocalClusterManagerImpl::~ThreadLocalClusterManagerImpl() {
+  ASSERT(thread_local_clusters_.empty());
+  ASSERT(host_http_conn_pool_map_.empty());
+}
+
 void ClusterManagerImpl::ThreadLocalClusterManagerImpl::drainConnPools(
-    HostPtr old_host, ConnPoolsContainer& container) {
+    const std::vector<HostSharedPtr>& hosts) {
+  for (const HostSharedPtr& host : hosts) {
+    auto container = host_http_conn_pool_map_.find(host);
+    if (container != host_http_conn_pool_map_.end()) {
+      drainConnPools(host, container->second);
+    }
+  }
+}
+
+void ClusterManagerImpl::ThreadLocalClusterManagerImpl::drainConnPools(
+    HostSharedPtr old_host, ConnPoolsContainer& container) {
   for (const Http::ConnectionPool::InstancePtr& pool : container.pools_) {
     if (pool) {
       container.drains_remaining_++;
@@ -302,9 +447,9 @@ void ClusterManagerImpl::ThreadLocalClusterManagerImpl::drainConnPools(
 }
 
 void ClusterManagerImpl::ThreadLocalClusterManagerImpl::updateClusterMembership(
-    const std::string& name, ConstHostVectorPtr hosts, ConstHostVectorPtr healthy_hosts,
-    ConstHostListsPtr hosts_per_zone, ConstHostListsPtr healthy_hosts_per_zone,
-    const std::vector<HostPtr>& hosts_added, const std::vector<HostPtr>& hosts_removed,
+    const std::string& name, HostVectorConstSharedPtr hosts, HostVectorConstSharedPtr healthy_hosts,
+    HostListsConstSharedPtr hosts_per_zone, HostListsConstSharedPtr healthy_hosts_per_zone,
+    const std::vector<HostSharedPtr>& hosts_added, const std::vector<HostSharedPtr>& hosts_removed,
     ThreadLocal::Instance& tls, uint32_t thead_local_slot) {
 
   ThreadLocalClusterManagerImpl& config =
@@ -323,7 +468,7 @@ void ClusterManagerImpl::ThreadLocalClusterManagerImpl::shutdown() {
 }
 
 ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::ClusterEntry(
-    ThreadLocalClusterManagerImpl& parent, ClusterInfoPtr cluster)
+    ThreadLocalClusterManagerImpl& parent, ClusterInfoConstSharedPtr cluster)
     : parent_(parent), cluster_info_(cluster),
       http_async_client_(*cluster, parent.parent_.stats_, parent.thread_local_dispatcher_,
                          parent.parent_.local_info_, parent.parent_, parent.parent_.runtime_,
@@ -346,26 +491,36 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::ClusterEntry(
                                          parent.parent_.runtime_, parent.parent_.random_));
     break;
   }
+  case LoadBalancerType::RingHash: {
+    lb_.reset(new RingHashLoadBalancer(host_set_, cluster->stats(), parent.parent_.runtime_,
+                                       parent.parent_.random_));
+    break;
+  }
   }
 
-  host_set_.addMemberUpdateCb(
-      [this](const std::vector<HostPtr>&, const std::vector<HostPtr>& hosts_removed) -> void {
-        // We need to go through and purge any connection pools for hosts that got deleted.
-        // Even if two hosts actually point to the same address this will be safe, since if a
-        // host is readded it will be a different physical HostPtr.
-        for (const HostPtr& old_host : hosts_removed) {
-          auto container = parent_.host_http_conn_pool_map_.find(old_host);
-          if (container != parent_.host_http_conn_pool_map_.end()) {
-            parent_.drainConnPools(old_host, container->second);
-          }
-        }
-      });
+  host_set_.addMemberUpdateCb([this](const std::vector<HostSharedPtr>&,
+                                     const std::vector<HostSharedPtr>& hosts_removed) -> void {
+    // We need to go through and purge any connection pools for hosts that got deleted.
+    // Even if two hosts actually point to the same address this will be safe, since if a
+    // host is readded it will be a different physical HostSharedPtr.
+    parent_.drainConnPools(hosts_removed);
+  });
+}
+
+ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::~ClusterEntry() {
+  // We need to drain all connection pools for the cluster being removed. Then we can remove the
+  // cluster.
+  //
+  // TODO(mattklein123): Optimally, we would just fire member changed callbacks and remove all of
+  // the hosts inside of the HostImpl destructor. That is a change with wide implications, so we are
+  // going with a more targeted approach for now.
+  parent_.drainConnPools(host_set_.hosts());
 }
 
 Http::ConnectionPool::Instance*
 ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::connPool(
-    ResourcePriority priority) {
-  ConstHostPtr host = lb_->chooseHost();
+    ResourcePriority priority, LoadBalancerContext* context) {
+  HostConstSharedPtr host = lb_->chooseHost(context);
   if (!host) {
     cluster_info_->stats().upstream_cx_none_healthy_.inc();
     return nullptr;
@@ -382,7 +537,7 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::connPool(
 }
 
 Http::ConnectionPool::InstancePtr
-ProdClusterManagerFactory::allocateConnPool(Event::Dispatcher& dispatcher, ConstHostPtr host,
+ProdClusterManagerFactory::allocateConnPool(Event::Dispatcher& dispatcher, HostConstSharedPtr host,
                                             ResourcePriority priority) {
   if ((host->cluster().features() & ClusterInfo::Features::HTTP2) &&
       runtime_.snapshot().featureEnabled("upstream.use_http2", 100)) {
@@ -397,10 +552,14 @@ ProdClusterManagerFactory::allocateConnPool(Event::Dispatcher& dispatcher, Const
 ClusterPtr
 ProdClusterManagerFactory::clusterFromJson(const Json::Object& cluster, ClusterManager& cm,
                                            const Optional<SdsConfig>& sds_config,
-                                           Outlier::EventLoggerPtr outlier_event_logger) {
+                                           Outlier::EventLoggerSharedPtr outlier_event_logger) {
   return ClusterImplBase::create(cluster, cm, stats_, tls_, dns_resolver_, ssl_context_manager_,
                                  runtime_, random_, primary_dispatcher_, sds_config, local_info_,
                                  outlier_event_logger);
+}
+
+CdsApiPtr ProdClusterManagerFactory::createCds(const Json::Object& config, ClusterManager& cm) {
+  return CdsApiImpl::create(config, cm, primary_dispatcher_, random_, local_info_, stats_);
 }
 
 } // Upstream

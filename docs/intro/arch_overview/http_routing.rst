@@ -18,22 +18,31 @@ request. The router filter supports the following features:
   programmatically determine whether routing rules conflict with each other. For this reason we
   don’t recommend regex/slug routing at the reverse proxy level, however we may add support in the
   future depending on demand.
-* :ref:`TLS redirection <config_http_conn_man_route_table_vhost_require_ssl>` at the virtual host level.
+* :ref:`TLS redirection <config_http_conn_man_route_table_vhost_require_ssl>` at the virtual host
+  level.
 * :ref:`Path <config_http_conn_man_route_table_route_path_redirect>`/:ref:`host
   <config_http_conn_man_route_table_route_host_redirect>` redirection at the route level.
-* :ref:`Host rewriting <config_http_conn_man_route_table_route_host_rewrite>`.
+* :ref:`Explicit host rewriting <config_http_conn_man_route_table_route_host_rewrite>`.
+* :ref:`Automatic host rewriting <config_http_conn_man_route_table_route_auto_host_rewrite>` based on
+  the DNS name of the selected upstream host.
 * :ref:`Prefix rewriting <config_http_conn_man_route_table_route_prefix_rewrite>`.
-* :ref:`Request retries <arch_overview_http_routing_retry>` specified either via HTTP header or via route configuration.
+* :ref:`Request retries <arch_overview_http_routing_retry>` specified either via HTTP header or via
+  route configuration.
 * Request timeout specified either via :ref:`HTTP
   header <config_http_filters_router_headers>` or via :ref:`route configuration
   <config_http_conn_man_route_table_route_timeout>`.
-* Runtime configuration routing rules. Runtime configuration can be used to create :ref:`traffic
-  shifting <config_http_conn_man_route_table_traffic_shifting>`.
-* Arbitrary headers :ref:`routing rules <config_http_conn_man_route_table_route_headers>`.
+* Traffic shifting from one upstream cluster to another via :ref:`runtime values
+  <config_http_conn_man_route_table_route_runtime>` (see :ref:`traffic shifting/splitting
+  <config_http_conn_man_route_table_traffic_splitting>`).
+* Traffic splitting across multiple upstream clusters using :ref:`weight/percentage-based routing
+  <config_http_conn_man_route_table_route_weighted_clusters>` (see :ref:`traffic shifting/splitting
+  <config_http_conn_man_route_table_traffic_splitting_split>`).
+* Arbitrary header matching :ref:`routing rules <config_http_conn_man_route_table_route_headers>`.
 * Virtual cluster specifications. A virtual cluster is specified at the virtual host level and is
   used by Envoy to generate additional statistics on top of the standard cluster level ones. Virtual
   clusters can use regex matching.
 * :ref:`Priority <arch_overview_http_routing_priority>` based routing.
+* :ref:`Hash policy <config_http_conn_man_route_table_hash_policy>` based routing.
 
 Route table
 -----------

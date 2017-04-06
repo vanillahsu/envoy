@@ -1,4 +1,4 @@
-#include "http_connection_manager.h"
+#include "server/config/network/http_connection_manager.h"
 
 #include "envoy/filesystem/filesystem.h"
 #include "envoy/network/connection.h"
@@ -10,38 +10,29 @@
 #include "common/http/http1/codec_impl.h"
 #include "common/http/http2/codec_impl.h"
 #include "common/http/utility.h"
-#include "common/json/json_loader.h"
-#include "common/router/config_impl.h"
-#include "server/configuration_impl.h"
+#include "common/json/config_schemas.h"
+#include "common/router/rds_impl.h"
 
 namespace Server {
 namespace Configuration {
 
 const std::string HttpConnectionManagerConfig::DEFAULT_SERVER_STRING = "envoy";
 
-/**
- * Config registration for the HTTP connection manager filter. @see NetworkFilterConfigFactory.
- */
-class HttpConnectionManagerFilterConfigFactory : Logger::Loggable<Logger::Id::config>,
-                                                 public NetworkFilterConfigFactory {
-public:
-  // NetworkFilterConfigFactory
-  NetworkFilterFactoryCb tryCreateFilterFactory(NetworkFilterType type, const std::string& name,
-                                                const Json::Object& config,
-                                                Server::Instance& server) {
-    if (type != NetworkFilterType::Read || name != "http_connection_manager") {
-      return nullptr;
-    }
-
-    std::shared_ptr<HttpConnectionManagerConfig> http_config(
-        new HttpConnectionManagerConfig(config, server));
-    return [http_config, &server](Network::FilterManager& filter_manager) mutable -> void {
-      filter_manager.addReadFilter(Network::ReadFilterPtr{
-          new Http::ConnectionManagerImpl(*http_config, server.drainManager(), server.random(),
-                                          server.httpTracer(), server.runtime())});
-    };
+NetworkFilterFactoryCb HttpConnectionManagerFilterConfigFactory::tryCreateFilterFactory(
+    NetworkFilterType type, const std::string& name, const Json::Object& config,
+    Server::Instance& server) {
+  if (type != NetworkFilterType::Read || name != "http_connection_manager") {
+    return nullptr;
   }
-};
+
+  std::shared_ptr<HttpConnectionManagerConfig> http_config(
+      new HttpConnectionManagerConfig(config, server));
+  return [http_config, &server](Network::FilterManager& filter_manager) mutable -> void {
+    filter_manager.addReadFilter(Network::ReadFilterSharedPtr{
+        new Http::ConnectionManagerImpl(*http_config, server.drainManager(), server.random(),
+                                        server.httpTracer(), server.runtime())});
+  };
+}
 
 /**
  * Static registration for the HTTP connection manager filter. @see
@@ -72,12 +63,19 @@ HttpConnectionManagerConfig::HttpConnectionManagerConfig(const Json::Object& con
                                                          Server::Instance& server)
     : server_(server), stats_prefix_(fmt::format("http.{}.", config.getString("stat_prefix"))),
       stats_(Http::ConnectionManagerImpl::generateStats(stats_prefix_, server.stats())),
+      tracing_stats_(
+          Http::ConnectionManagerImpl::generateTracingStats(stats_prefix_, server.stats())),
       codec_options_(Http::Utility::parseCodecOptions(config)),
-      route_config_(new Router::ConfigImpl(*config.getObject("route_config"), server.runtime(),
-                                           server.clusterManager())),
       drain_timeout_(config.getInteger("drain_timeout_ms", 5000)),
       generate_request_id_(config.getBoolean("generate_request_id", true)),
       date_provider_(server.dispatcher(), server.threadLocal()) {
+
+  config.validateSchema(Json::Schema::HTTP_CONN_NETWORK_FILTER_SCHEMA);
+
+  route_config_provider_ = Router::RouteConfigProviderUtil::create(
+      config, server.runtime(), server.clusterManager(), server.dispatcher(), server.random(),
+      server.localInfo(), server.stats(), stats_prefix_, server.threadLocal(),
+      server.initManager());
 
   if (config.hasObject("use_remote_address")) {
     use_remote_address_ = config.getBoolean("use_remote_address");
@@ -88,19 +86,27 @@ HttpConnectionManagerConfig::HttpConnectionManagerConfig(const Json::Object& con
   }
 
   if (config.hasObject("tracing")) {
-    const std::string operation_name = config.getObject("tracing")->getString("operation_name");
+    Json::ObjectPtr tracing_config = config.getObject("tracing");
 
-    std::string tracing_type = config.getObject("tracing")->getString("type", "all");
-    Http::TracingType type;
-    if (tracing_type == "all") {
-      type = Http::TracingType::All;
-    } else if (tracing_type == "upstream_failure") {
-      type = Http::TracingType::UpstreamFailure;
+    const std::string operation_name = tracing_config->getString("operation_name");
+    Tracing::OperationName tracing_operation_name;
+    std::vector<Http::LowerCaseString> request_headers_for_tags;
+
+    if (operation_name == "ingress") {
+      tracing_operation_name = Tracing::OperationName::Ingress;
     } else {
-      throw EnvoyException(fmt::format("unsupported tracing type '{}'", tracing_type));
+      ASSERT(operation_name == "egress");
+      tracing_operation_name = Tracing::OperationName::Egress;
     }
 
-    tracing_config_.value({operation_name, type});
+    if (tracing_config->hasObject("request_headers_for_tags")) {
+      for (const std::string& header : tracing_config->getStringArray("request_headers_for_tags")) {
+        request_headers_for_tags.push_back(Http::LowerCaseString(header));
+      }
+    }
+
+    tracing_config_.reset(new Http::TracingConnectionManagerConfig(
+        {tracing_operation_name, request_headers_for_tags}));
   }
 
   if (config.hasObject("idle_timeout_s")) {
@@ -109,8 +115,9 @@ HttpConnectionManagerConfig::HttpConnectionManagerConfig(const Json::Object& con
 
   if (config.hasObject("access_log")) {
     for (Json::ObjectPtr& access_log : config.getObjectArray("access_log")) {
-      Http::AccessLog::InstancePtr current_access_log = Http::AccessLog::InstanceImpl::fromJson(
-          *access_log, server.runtime(), server.accessLogManager());
+      Http::AccessLog::InstanceSharedPtr current_access_log =
+          Http::AccessLog::InstanceImpl::fromJson(*access_log, server.runtime(),
+                                                  server.accessLogManager());
       access_logs_.push_back(current_access_log);
     }
   }
@@ -199,8 +206,8 @@ HttpFilterType HttpConnectionManagerConfig::stringToType(const std::string& type
   }
 }
 
-const std::string& HttpConnectionManagerConfig::localAddress() {
-  return server_.localInfo().address();
+const Network::Address::Instance& HttpConnectionManagerConfig::localAddress() {
+  return *server_.localInfo().address();
 }
 
 } // Configuration

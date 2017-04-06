@@ -1,4 +1,4 @@
-#include "access_log_formatter.h"
+#include "common/http/access_log/access_log_formatter.h"
 
 #include "common/common/assert.h"
 #include "common/common/utility.h"
@@ -82,18 +82,6 @@ const std::string ResponseFlagUtils::toShortString(const RequestInfo& request_in
   return result.empty() ? NONE : result;
 }
 
-bool ResponseFlagUtils::isTraceableFailure(const Http::AccessLog::RequestInfo& request_info) {
-  return request_info.getResponseFlag(Http::AccessLog::ResponseFlag::NoHealthyUpstream) |
-         request_info.getResponseFlag(Http::AccessLog::ResponseFlag::UpstreamConnectionFailure) |
-         request_info.getResponseFlag(Http::AccessLog::ResponseFlag::UpstreamOverflow) |
-         request_info.getResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout) |
-         request_info.getResponseFlag(
-             Http::AccessLog::ResponseFlag::UpstreamConnectionTermination) |
-         request_info.getResponseFlag(Http::AccessLog::ResponseFlag::NoRouteFound) |
-         request_info.getResponseFlag(Http::AccessLog::ResponseFlag::DelayInjected) |
-         request_info.getResponseFlag(Http::AccessLog::ResponseFlag::FaultInjected);
-}
-
 const std::string AccessLogFormatUtils::DEFAULT_FORMAT =
     "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" "
     "%RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% "
@@ -156,7 +144,7 @@ void AccessLogFormatParser::parseCommand(const std::string& token, const size_t 
     }
 
     std::string length_str = token.substr(end_request + 2);
-    size_t length_value;
+    uint64_t length_value;
 
     if (!StringUtil::atoul(length_str.c_str(), length_value)) {
       throw EnvoyException(fmt::format("Length must be an integer, given: {}", length_str));
@@ -263,12 +251,20 @@ RequestInfoFormatter::RequestInfoFormatter(const std::string& field_name) {
     };
   } else if (field_name == "UPSTREAM_HOST") {
     field_extractor_ = [](const RequestInfo& request_info) {
-      std::string upstream_host_url;
+      if (request_info.upstreamHost()) {
+        return request_info.upstreamHost()->address()->asString();
+      } else {
+        return std::string("-");
+      }
+    };
+  } else if (field_name == "UPSTREAM_CLUSTER") {
+    field_extractor_ = [](const RequestInfo& request_info) {
+      std::string upstream_cluster_name;
       if (nullptr != request_info.upstreamHost()) {
-        upstream_host_url = request_info.upstreamHost()->url();
+        upstream_cluster_name = request_info.upstreamHost()->cluster().name();
       }
 
-      return upstream_host_url.empty() ? "-" : upstream_host_url;
+      return upstream_cluster_name.empty() ? "-" : upstream_cluster_name;
     };
   } else {
     throw EnvoyException(fmt::format("Not supported field in RequestInfo: {}", field_name));

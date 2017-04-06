@@ -1,16 +1,8 @@
-#include "sds.h"
+#include "common/upstream/sds.h"
 
-#include "envoy/event/dispatcher.h"
-#include "envoy/event/timer.h"
-#include "envoy/http/codes.h"
-#include "envoy/upstream/cluster_manager.h"
-#include "envoy/upstream/health_checker.h"
-
-#include "common/common/enum_to_int.h"
 #include "common/http/headers.h"
-#include "common/http/message_impl.h"
-#include "common/http/utility.h"
-#include "common/json/json_loader.h"
+#include "common/json/config_schemas.h"
+#include "common/network/address_impl.h"
 #include "common/network/utility.h"
 
 namespace Upstream {
@@ -20,44 +12,15 @@ SdsClusterImpl::SdsClusterImpl(const Json::Object& config, Runtime::Loader& runt
                                const SdsConfig& sds_config, const LocalInfo::LocalInfo& local_info,
                                ClusterManager& cm, Event::Dispatcher& dispatcher,
                                Runtime::RandomGenerator& random)
-    : BaseDynamicClusterImpl(config, runtime, stats, ssl_context_manager), cm_(cm),
-      sds_config_(sds_config), local_info_(local_info),
-      service_name_(config.getString("service_name")), random_(random),
-      refresh_timer_(dispatcher.createTimer([this]() -> void { refreshHosts(); })) {}
+    : BaseDynamicClusterImpl(config, runtime, stats, ssl_context_manager),
+      RestApiFetcher(cm, sds_config.sds_cluster_name_, dispatcher, random,
+                     sds_config.refresh_delay_),
+      local_info_(local_info), service_name_(config.getString("service_name")) {}
 
-SdsClusterImpl::~SdsClusterImpl() {
-  if (active_request_) {
-    active_request_->cancel();
-  }
-}
-
-void SdsClusterImpl::onSuccess(Http::MessagePtr&& response) {
-  uint64_t response_code = Http::Utility::getResponseStatus(response->headers());
-  if (response_code != enumToInt(Http::Code::OK)) {
-    onFailure(Http::AsyncClient::FailureReason::Reset);
-    return;
-  }
-
-  try {
-    parseSdsResponse(*response);
-  } catch (EnvoyException& e) {
-    onFailure(Http::AsyncClient::FailureReason::Reset);
-    return;
-  }
-
-  info_->stats().update_success_.inc();
-  requestComplete();
-}
-
-void SdsClusterImpl::onFailure(Http::AsyncClient::FailureReason) {
-  log_debug("sds refresh failure for cluster: {}", info_->name());
-  info_->stats().update_failure_.inc();
-  requestComplete();
-}
-
-void SdsClusterImpl::parseSdsResponse(Http::Message& response) {
+void SdsClusterImpl::parseResponse(const Http::Message& response) {
   Json::ObjectPtr json = Json::Factory::LoadFromString(response.bodyAsString());
-  std::vector<HostPtr> new_hosts;
+  json->validateSchema(Json::Schema::SDS_SCHEMA);
+  std::vector<HostSharedPtr> new_hosts;
   for (const Json::ObjectPtr& host : json->getObjectArray("hosts")) {
     bool canary = false;
     uint32_t weight = 1;
@@ -69,23 +32,24 @@ void SdsClusterImpl::parseSdsResponse(Http::Message& response) {
     }
 
     new_hosts.emplace_back(new HostImpl(
-        info_, Network::Utility::urlForTcp(host->getString("ip_address"), host->getInteger("port")),
+        info_, "", Network::Address::InstanceConstSharedPtr{new Network::Address::Ipv4Instance(
+                       host->getString("ip_address"), host->getInteger("port"))},
         canary, weight, zone));
   }
 
-  HostVectorPtr current_hosts_copy(new std::vector<HostPtr>(hosts()));
-  std::vector<HostPtr> hosts_added;
-  std::vector<HostPtr> hosts_removed;
+  HostVectorSharedPtr current_hosts_copy(new std::vector<HostSharedPtr>(hosts()));
+  std::vector<HostSharedPtr> hosts_added;
+  std::vector<HostSharedPtr> hosts_removed;
   if (updateDynamicHostList(new_hosts, *current_hosts_copy, hosts_added, hosts_removed,
                             health_checker_ != nullptr)) {
     log_debug("sds hosts changed for cluster: {} ({})", info_->name(), hosts().size());
-    HostListsPtr per_zone(new std::vector<std::vector<HostPtr>>());
+    HostListsSharedPtr per_zone(new std::vector<std::vector<HostSharedPtr>>());
 
     // If local zone name is not defined then skip populating per zone hosts.
     if (!local_info_.zoneName().empty()) {
-      std::map<std::string, std::vector<HostPtr>> hosts_per_zone;
+      std::map<std::string, std::vector<HostSharedPtr>> hosts_per_zone;
 
-      for (HostPtr host : *current_hosts_copy) {
+      for (HostSharedPtr host : *current_hosts_copy) {
         hosts_per_zone[host->zone()].push_back(host);
       }
 
@@ -107,7 +71,7 @@ void SdsClusterImpl::parseSdsResponse(Http::Message& response) {
     if (initialize_callback_ && health_checker_ && pending_health_checks_ == 0) {
       pending_health_checks_ = hosts().size();
       ASSERT(pending_health_checks_ > 0);
-      health_checker_->addHostCheckCompleteCb([this](HostPtr, bool) -> void {
+      health_checker_->addHostCheckCompleteCb([this](HostSharedPtr, bool) -> void {
         if (pending_health_checks_ > 0 && --pending_health_checks_ == 0) {
           initialize_callback_();
           initialize_callback_ = nullptr;
@@ -115,22 +79,27 @@ void SdsClusterImpl::parseSdsResponse(Http::Message& response) {
       });
     }
   }
+
+  info_->stats().update_success_.inc();
 }
 
-void SdsClusterImpl::refreshHosts() {
+void SdsClusterImpl::onFetchFailure(EnvoyException* e) {
+  log_debug("sds refresh failure for cluster: {}", info_->name());
+  info_->stats().update_failure_.inc();
+  if (e) {
+    log().warn("sds parsing error: {}", e->what());
+  }
+}
+
+void SdsClusterImpl::createRequest(Http::Message& message) {
   log_debug("starting sds refresh for cluster: {}", info_->name());
   info_->stats().update_attempt_.inc();
 
-  Http::MessagePtr message(new Http::RequestMessageImpl());
-  message->headers().insertMethod().value(Http::Headers::get().MethodValues.Get);
-  message->headers().insertPath().value("/v1/registration/" + service_name_);
-  message->headers().insertHost().value(sds_config_.sds_cluster_name_);
-  active_request_ = cm_.httpAsyncClientForCluster(sds_config_.sds_cluster_name_)
-                        .send(std::move(message), *this,
-                              Optional<std::chrono::milliseconds>(std::chrono::milliseconds(1000)));
+  message.headers().insertMethod().value(Http::Headers::get().MethodValues.Get);
+  message.headers().insertPath().value("/v1/registration/" + service_name_);
 }
 
-void SdsClusterImpl::requestComplete() {
+void SdsClusterImpl::onFetchComplete() {
   log_debug("sds refresh complete for cluster: {}", info_->name());
   // If we didn't setup to initialize when our first round of health checking is complete, just
   // do it now.
@@ -138,15 +107,6 @@ void SdsClusterImpl::requestComplete() {
     initialize_callback_();
     initialize_callback_ = nullptr;
   }
-
-  active_request_ = nullptr;
-
-  // Add refresh jitter based on the configured interval.
-  std::chrono::milliseconds final_delay =
-      sds_config_.refresh_delay_ +
-      std::chrono::milliseconds(random_.random() % sds_config_.refresh_delay_.count());
-
-  refresh_timer_->enableTimer(final_delay);
 }
 
 } // Upstream

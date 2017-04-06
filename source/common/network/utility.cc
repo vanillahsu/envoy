@@ -1,4 +1,4 @@
-#include "utility.h"
+#include "common/network/utility.h"
 
 #include "envoy/common/exception.h"
 #include "envoy/network/connection.h"
@@ -6,17 +6,15 @@
 
 #include "common/common/assert.h"
 #include "common/common/utility.h"
+#include "common/network/address_impl.h"
 
 #include <ifaddrs.h>
+#include <linux/netfilter_ipv4.h>
 
 namespace Network {
 
-IpWhiteList::IpWhiteList(const Json::Object& config) {
-  if (!config.hasObject("ip_white_list")) {
-    return;
-  }
-
-  for (const std::string& entry : config.getStringArray("ip_white_list")) {
+IpList::IpList(const std::vector<std::string>& subnets) {
+  for (const std::string& entry : subnets) {
     std::vector<std::string> parts = StringUtil::split(entry, '/');
     if (parts.size() != 2) {
       throw EnvoyException(
@@ -29,37 +27,40 @@ IpWhiteList::IpWhiteList(const Json::Object& config) {
       throw EnvoyException(fmt::format("invalid ipv4/mask combo '{}' (invalid IP address)", entry));
     }
 
+    // "0.0.0.0/0" is a valid subnet that contains all possible IPv4 addresses,
+    // so mask can be equal to 0
     uint64_t mask;
     if (!StringUtil::atoul(parts[1].c_str(), mask) || mask > 32) {
       throw EnvoyException(
           fmt::format("invalid ipv4/mask combo '{}' (mask bits must be <= 32)", entry));
     }
 
-    Ipv4Entry white_list_entry;
-    white_list_entry.ipv4_address_ = ntohl(addr.s_addr);
-    white_list_entry.ipv4_mask_ = ~((1 << (32 - mask)) - 1);
+    Ipv4Entry list_entry;
+    list_entry.ipv4_address_ = ntohl(addr.s_addr);
+    // The 1ULL below makes sure that the RHS is computed as a 64-bit value, so that we do not
+    // over-shift to the left when mask = 0. The assignment to ipv4_mask_ then truncates
+    // the value back to 32 bits.
+    list_entry.ipv4_mask_ = ~((1ULL << (32 - mask)) - 1);
 
     // Check to make sure applying the mask to the address equals the address. This can prevent
     // user error.
-    if ((white_list_entry.ipv4_address_ & white_list_entry.ipv4_mask_) !=
-        white_list_entry.ipv4_address_) {
+    if ((list_entry.ipv4_address_ & list_entry.ipv4_mask_) != list_entry.ipv4_address_) {
       throw EnvoyException(
           fmt::format("invalid ipv4/mask combo '{}' ((address & mask) != address)", entry));
     }
 
-    ipv4_white_list_.push_back(white_list_entry);
+    ipv4_list_.push_back(list_entry);
   }
 }
 
-bool IpWhiteList::contains(const std::string& remote_address) const {
-  in_addr addr;
-  int rc = inet_pton(AF_INET, remote_address.c_str(), &addr);
-  if (1 != rc) {
+bool IpList::contains(const Address::Instance& address) const {
+  if (address.type() != Address::Type::Ip) {
     return false;
   }
 
-  for (const Ipv4Entry& entry : ipv4_white_list_) {
-    if ((ntohl(addr.s_addr) & entry.ipv4_mask_) == entry.ipv4_address_) {
+  for (const Ipv4Entry& entry : ipv4_list_) {
+    // TODO(mattklein123): IPv6 support
+    if ((ntohl(address.ip()->ipv4()->address()) & entry.ipv4_mask_) == entry.ipv4_address_) {
       return true;
     }
   }
@@ -67,52 +68,29 @@ bool IpWhiteList::contains(const std::string& remote_address) const {
   return false;
 }
 
+IpList::IpList(const Json::Object& config, const std::string& member_name)
+    : IpList(config.hasObject(member_name) ? config.getStringArray(member_name)
+                                           : std::vector<std::string>()) {}
+
 const std::string Utility::TCP_SCHEME = "tcp://";
 const std::string Utility::UNIX_SCHEME = "unix://";
 
-AddrInfoPtr Utility::resolveTCP(const std::string& host, uint32_t port) {
-  addrinfo addrinfo_hints;
-  memset(&addrinfo_hints, 0, sizeof(addrinfo_hints));
-  addrinfo_hints.ai_family = AF_INET;
-  addrinfo_hints.ai_socktype = SOCK_STREAM;
-  addrinfo_hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
-
-  const char* host_to_use;
-  if (!host.empty()) {
-    host_to_use = host.c_str();
-  } else {
-    host_to_use = nullptr;
-    addrinfo_hints.ai_flags |= AI_PASSIVE;
-  }
-
-  std::string port_string = std::to_string(port);
-  addrinfo* addrinfo_out;
-  if (0 != getaddrinfo(host_to_use, port_string.c_str(), &addrinfo_hints, &addrinfo_out)) {
-    throw EnvoyException(fmt::format("unable to resolve host {} : {}", host, gai_strerror(errno)));
-  }
-
-  return AddrInfoPtr{addrinfo_out};
-}
-
-sockaddr_un Utility::resolveUnixDomainSocket(const std::string& path) {
-  sockaddr_un address;
-  memset(&address, 0, sizeof(address));
-  address.sun_family = AF_UNIX;
-  StringUtil::strlcpy(&address.sun_path[0], path.c_str(), sizeof(address.sun_path));
-  return address;
-}
-
-void Utility::resolve(const std::string& url) {
+Address::InstanceConstSharedPtr Utility::resolveUrl(const std::string& url) {
+  // TODO(mattklein123): IPv6 support.
+  // TODO(mattklein123): We still support the legacy tcp:// and unix:// names. We should
+  // support/parse ip:// and pipe:// as better names.
   if (url.find(TCP_SCHEME) == 0) {
-    resolveTCP(hostFromUrl(url), portFromUrl(url));
+    return Address::InstanceConstSharedPtr{
+        new Address::Ipv4Instance(hostFromTcpUrl(url), portFromTcpUrl(url))};
   } else if (url.find(UNIX_SCHEME) == 0) {
-    resolveUnixDomainSocket(pathFromUrl(url));
+    return Address::InstanceConstSharedPtr{
+        new Address::PipeInstance(url.substr(UNIX_SCHEME.size()))};
   } else {
     throw EnvoyException(fmt::format("unknown protocol scheme: {}", url));
   }
 }
 
-std::string Utility::hostFromUrl(const std::string& url) {
+std::string Utility::hostFromTcpUrl(const std::string& url) {
   if (url.find(TCP_SCHEME) != 0) {
     throw EnvoyException(fmt::format("unknown protocol scheme: {}", url));
   }
@@ -126,7 +104,7 @@ std::string Utility::hostFromUrl(const std::string& url) {
   return url.substr(TCP_SCHEME.size(), colon_index - TCP_SCHEME.size());
 }
 
-uint32_t Utility::portFromUrl(const std::string& url) {
+uint32_t Utility::portFromTcpUrl(const std::string& url) {
   if (url.find(TCP_SCHEME) != 0) {
     throw EnvoyException(fmt::format("unknown protocol scheme: {}", url));
   }
@@ -144,22 +122,10 @@ uint32_t Utility::portFromUrl(const std::string& url) {
   }
 }
 
-std::string Utility::pathFromUrl(const std::string& url) {
-  if (url.find(UNIX_SCHEME) != 0) {
-    throw EnvoyException(fmt::format("unknown protocol scheme: {}", url));
-  }
-
-  return url.substr(UNIX_SCHEME.size());
-}
-
-std::string Utility::urlForTcp(const std::string& address, uint32_t port) {
-  return fmt::format("{}{}:{}", TCP_SCHEME, address, port);
-}
-
-std::string Utility::getLocalAddress() {
+Address::InstanceConstSharedPtr Utility::getLocalAddress() {
   struct ifaddrs* ifaddr;
   struct ifaddrs* ifa;
-  std::string ret;
+  Address::InstanceConstSharedPtr ret;
 
   int rc = getifaddrs(&ifaddr);
   RELEASE_ASSERT(!rc);
@@ -174,7 +140,7 @@ std::string Utility::getLocalAddress() {
     if (ifa->ifa_addr->sa_family == AF_INET) {
       sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
       if (htonl(INADDR_LOOPBACK) != addr->sin_addr.s_addr) {
-        ret = getAddressName(addr);
+        ret.reset(new Address::Ipv4Instance(addr));
         break;
       }
     }
@@ -186,14 +152,6 @@ std::string Utility::getLocalAddress() {
 
   return ret;
 }
-
-std::string Utility::getAddressName(sockaddr_in* addr) {
-  char str[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &addr->sin_addr, str, INET_ADDRSTRLEN);
-  return std::string(str);
-}
-
-uint16_t Utility::getAddressPort(sockaddr_in* addr) { return ntohs(addr->sin_port); }
 
 bool Utility::isInternalAddress(const char* address) {
   in_addr addr;
@@ -213,21 +171,89 @@ bool Utility::isInternalAddress(const char* address) {
   return false;
 }
 
-bool Utility::isLoopbackAddress(const char* address) {
-  in_addr addr;
-  int rc = inet_pton(AF_INET, address, &addr);
-  if (1 != rc) {
+bool Utility::isLoopbackAddress(const Address::Instance& address) {
+  if (address.type() != Address::Type::Ip) {
     return false;
   }
 
-  return addr.s_addr == htonl(INADDR_LOOPBACK);
+  return address.ip()->ipv4()->address() == htonl(INADDR_LOOPBACK);
 }
 
-bool Utility::getOriginalDst(int fd, sockaddr_storage* orig_addr) {
-  socklen_t addr_len = sizeof(sockaddr_storage);
-  int status = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, orig_addr, &addr_len);
+Address::InstanceConstSharedPtr Utility::getCanonicalIpv4LoopbackAddress() {
+  // Initialized on first call in a thread-safe manner.
+  static Address::InstanceConstSharedPtr loopback(new Address::Ipv4Instance("127.0.0.1", 0));
+  return loopback;
+}
 
-  return (status == 0);
+Address::InstanceConstSharedPtr Utility::getIpv6LoopbackAddress() {
+  // Initialized on first call in a thread-safe manner.
+  static Address::InstanceConstSharedPtr loopback(new Address::Ipv6Instance("::1", 0));
+  return loopback;
+}
+
+Address::InstanceConstSharedPtr Utility::getIpv4AnyAddress() {
+  // Initialized on first call in a thread-safe manner.
+  static Address::InstanceConstSharedPtr any(new Address::Ipv4Instance(static_cast<uint32_t>(0)));
+  return any;
+}
+
+Address::InstanceConstSharedPtr Utility::getIpv6AnyAddress() {
+  // Initialized on first call in a thread-safe manner.
+  static Address::InstanceConstSharedPtr any(new Address::Ipv6Instance(static_cast<uint32_t>(0)));
+  return any;
+}
+
+Address::InstanceConstSharedPtr Utility::getOriginalDst(int fd) {
+  sockaddr_storage orig_addr;
+  socklen_t addr_len = sizeof(sockaddr_storage);
+  int status = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &orig_addr, &addr_len);
+
+  if (status == 0) {
+    // TODO(mattklein123): IPv6 support
+    ASSERT(orig_addr.ss_family == AF_INET);
+    return Address::InstanceConstSharedPtr{
+        new Address::Ipv4Instance(reinterpret_cast<sockaddr_in*>(&orig_addr))};
+  } else {
+    return nullptr;
+  }
+}
+
+void Utility::parsePortRangeList(const std::string& string, std::list<PortRange>& list) {
+  std::vector<std::string> ranges = StringUtil::split(string.c_str(), ',');
+  for (const std::string& s : ranges) {
+    std::stringstream ss(s);
+    uint32_t min = 0;
+    uint32_t max = 0;
+
+    if (s.find('-') != std::string::npos) {
+      char dash = 0;
+      ss >> min;
+      ss >> dash;
+      ss >> max;
+    } else {
+      ss >> min;
+      max = min;
+    }
+
+    if (s.empty() || (min > 65535) || (max > 65535) || ss.fail() || !ss.eof()) {
+      throw EnvoyException(fmt::format("invalid port number or range '{}'", s));
+    }
+
+    list.emplace_back(PortRange(min, max));
+  }
+}
+
+bool Utility::portInRangeList(const Address::Instance& address, const std::list<PortRange>& list) {
+  if (address.type() != Address::Type::Ip) {
+    return false;
+  }
+
+  for (const Network::PortRange& p : list) {
+    if (p.contains(address.ip()->port())) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // Network

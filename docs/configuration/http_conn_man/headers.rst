@@ -48,7 +48,8 @@ external requests, but for internal requests will contain the service cluster of
 that in the current implementation, this should be considered a hint as it is set by the caller and
 could be easily spoofed by any internal entity. In the future Envoy will support a mutual
 authentication TLS mesh which will make this header fully secure. Like *user-agent*, the value
-is determined by the :option:`--service-cluster` command line option.
+is determined by the :option:`--service-cluster` command line option. In order to enable this
+feature you need to set the :ref:`user_agent <config_http_conn_man_add_user_agent>` option to true.
 
 .. _config_http_conn_man_headers_x-envoy-external-address:
 
@@ -72,10 +73,10 @@ x-envoy-force-trace
 If an internal request sets this header, Envoy will modify the generated
 :ref:`config_http_conn_man_headers_x-request-id` such that it forces traces to be collected.
 This also forces :ref:`config_http_conn_man_headers_x-request-id` to be returned in the response
-headers. If this request ID is then propagated to other hosts, traces will also be collected on 
-those hosts which will provide a consistent trace for an entire request flow. See the 
-:ref:`tracing.global_enabled <config_http_conn_man_runtime_global_enabled>` and 
-:ref:`tracing.random_sampling <config_http_conn_man_runtime_random_sampling>` runtime 
+headers. If this request ID is then propagated to other hosts, traces will also be collected on
+those hosts which will provide a consistent trace for an entire request flow. See the
+:ref:`tracing.global_enabled <config_http_conn_man_runtime_global_enabled>` and
+:ref:`tracing.random_sampling <config_http_conn_man_runtime_random_sampling>` runtime
 configuration settings.
 
 .. _config_http_conn_man_headers_x-envoy-internal:
@@ -155,8 +156,23 @@ is one of the few areas where a thin client library is needed to perform this du
 is out of scope for this documentation. If *x-request-id* is propagated across all hosts, the
 following features are available:
 
-* Stable :ref:`access logging <config_http_conn_man_access_log>` via the sampling filter.
+* Stable :ref:`access logging <config_http_conn_man_access_log>` via the
+  :ref:`runtime filter<config_http_con_manager_access_log_filters_runtime>`.
 * Stable tracing when performing random sampling via the :ref:`tracing.random_sampling
   <config_http_conn_man_runtime_random_sampling>` runtime setting or via forced tracing using the
   :ref:`config_http_conn_man_headers_x-envoy-force-trace` and
   :ref:`config_http_conn_man_headers_x-client-trace-id` headers.
+
+.. _config_http_conn_man_headers_x-ot-span-context:
+
+x-ot-span-context
+-----------------
+
+The *x-ot-span-context* HTTP header is used by Envoy to establish proper parent-child relationships
+between tracing spans for LightStep tracing. *x-ot-span-context* is a Base64 encoded
+`binary OT <https://github.com/opentracing/basictracer-go/blob/master/wire/wire.proto>`_ carrier.
+Envoy relies on data from the *x-ot-span-context* header to extract the parent
+context for the current span. For example, an egress span is a child of an ingress
+span (if the ingress span was present). Envoy injects the *x-ot-span-context* header on ingress requests and
+forwards it to the local service. Envoy relies on the application to propagate *x-ot-span-context* on
+the egress call to an upstream. See more on tracing :ref:`here <arch_overview_tracing>`.

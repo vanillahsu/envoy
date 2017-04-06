@@ -2,7 +2,9 @@
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/api/api.h"
+#include "envoy/init/init.h"
 #include "envoy/local_info/local_info.h"
+#include "envoy/network/listen_socket.h"
 #include "envoy/ratelimit/ratelimit.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/server/admin.h"
@@ -81,11 +83,18 @@ public:
   virtual void failHealthcheck(bool fail) PURE;
 
   /**
-   * Fetch a listen socket fd based on the listening port.
-   * @param port supplies the port to look up.
-   * @return the fd or -1 if there is no listening socket for the port.
+   * Fetch a listen socket fd based on the listening address.
+   * @param address supplies the address to look up.
+   * @return the fd or -1 if there is no listening socket for the address.
    */
-  virtual int getListenSocketFd(uint32_t port) PURE;
+  virtual int getListenSocketFd(const std::string& address) PURE;
+
+  /**
+   * Obtain a listen socket pointer based on the listener config array index.
+   * @param index array index.
+   * @return Network::ListenSocket* when index is in bounds, nullptr otherwise.
+   */
+  virtual Network::ListenSocket* getListenSocketByIndex(uint32_t index) PURE;
 
   /**
    * Fetch server stats specific to this process vs. global shared stats in a hot restart scenario.
@@ -102,6 +111,16 @@ public:
    * @return the server's hot restarter.
    */
   virtual HotRestart& hotRestart() PURE;
+
+  /**
+   * @return the server's init manager. This can be used for extensions that need to initialize
+   *         after cluster manager init but before the server starts listening. All extensions
+   *         should register themselves during configuration load. initialize() will be called on
+   *         each registered target after cluster manager init but before the server starts
+   *         listening. Once all targets have initialized and invoked their callbacks, the server
+   *         will start listening.
+   */
+  virtual Init::Manager& initManager() PURE;
 
   /**
    * @return the server's CLI options.

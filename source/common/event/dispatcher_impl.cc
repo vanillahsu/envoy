@@ -1,11 +1,11 @@
-#include "dispatcher_impl.h"
-#include "file_event_impl.h"
-#include "signal_impl.h"
-#include "timer_impl.h"
+#include "common/event/dispatcher_impl.h"
 
 #include "envoy/network/listener.h"
 #include "envoy/network/listen_socket.h"
 
+#include "common/event/file_event_impl.h"
+#include "common/event/signal_impl.h"
+#include "common/event/timer_impl.h"
 #include "common/filesystem/watcher_impl.h"
 #include "common/network/connection_impl.h"
 #include "common/network/dns_impl.h"
@@ -19,6 +19,7 @@ namespace Event {
 DispatcherImpl::DispatcherImpl()
     : base_(event_base_new()),
       deferred_delete_timer_(createTimer([this]() -> void { clearDeferredDeleteList(); })),
+      post_timer_(createTimer([this]() -> void { runPostCallbacks(); })),
       current_to_delete_(&to_delete_1_) {}
 
 DispatcherImpl::~DispatcherImpl() {}
@@ -54,45 +55,46 @@ void DispatcherImpl::clearDeferredDeleteList() {
   deferred_deleting_ = false;
 }
 
-Network::ClientConnectionPtr DispatcherImpl::createClientConnection(const std::string& url) {
-  return Network::ClientConnectionImpl::create(*this, url);
+Network::ClientConnectionPtr
+DispatcherImpl::createClientConnection(Network::Address::InstanceConstSharedPtr address) {
+  return Network::ClientConnectionPtr{new Network::ClientConnectionImpl(*this, address)};
 }
 
-Network::ClientConnectionPtr DispatcherImpl::createSslClientConnection(Ssl::ClientContext& ssl_ctx,
-                                                                       const std::string& url) {
-  return Network::ClientConnectionPtr{new Ssl::ClientConnectionImpl(*this, ssl_ctx, url)};
+Network::ClientConnectionPtr
+DispatcherImpl::createSslClientConnection(Ssl::ClientContext& ssl_ctx,
+                                          Network::Address::InstanceConstSharedPtr address) {
+  return Network::ClientConnectionPtr{new Ssl::ClientConnectionImpl(*this, ssl_ctx, address)};
 }
 
 Network::DnsResolverPtr DispatcherImpl::createDnsResolver() {
   return Network::DnsResolverPtr{new Network::DnsResolverImpl(*this)};
 }
 
-FileEventPtr DispatcherImpl::createFileEvent(int fd, FileReadyCb cb) {
-  return FileEventPtr{new FileEventImpl(*this, fd, cb)};
+FileEventPtr DispatcherImpl::createFileEvent(int fd, FileReadyCb cb, FileTriggerType trigger,
+                                             uint32_t events) {
+  return FileEventPtr{new FileEventImpl(*this, fd, cb, trigger, events)};
 }
 
 Filesystem::WatcherPtr DispatcherImpl::createFilesystemWatcher() {
   return Filesystem::WatcherPtr{new Filesystem::WatcherImpl(*this)};
 }
 
-Network::ListenerPtr DispatcherImpl::createListener(Network::ConnectionHandler& conn_handler,
-                                                    Network::ListenSocket& socket,
-                                                    Network::ListenerCallbacks& cb,
-                                                    Stats::Store& stats_store, bool bind_to_port,
-                                                    bool use_proxy_proto, bool use_orig_dst) {
-  return Network::ListenerPtr{new Network::ListenerImpl(
-      conn_handler, *this, socket, cb, stats_store, bind_to_port, use_proxy_proto, use_orig_dst)};
+Network::ListenerPtr
+DispatcherImpl::createListener(Network::ConnectionHandler& conn_handler,
+                               Network::ListenSocket& socket, Network::ListenerCallbacks& cb,
+                               Stats::Scope& scope,
+                               const Network::ListenerOptions& listener_options) {
+  return Network::ListenerPtr{
+      new Network::ListenerImpl(conn_handler, *this, socket, cb, scope, listener_options)};
 }
 
-Network::ListenerPtr DispatcherImpl::createSslListener(Network::ConnectionHandler& conn_handler,
-                                                       Ssl::ServerContext& ssl_ctx,
-                                                       Network::ListenSocket& socket,
-                                                       Network::ListenerCallbacks& cb,
-                                                       Stats::Store& stats_store, bool bind_to_port,
-                                                       bool use_proxy_proto, bool use_orig_dst) {
+Network::ListenerPtr
+DispatcherImpl::createSslListener(Network::ConnectionHandler& conn_handler,
+                                  Ssl::ServerContext& ssl_ctx, Network::ListenSocket& socket,
+                                  Network::ListenerCallbacks& cb, Stats::Scope& scope,
+                                  const Network::ListenerOptions& listener_options) {
   return Network::ListenerPtr{new Network::SslListenerImpl(conn_handler, *this, ssl_ctx, socket, cb,
-                                                           stats_store, bind_to_port,
-                                                           use_proxy_proto, use_orig_dst)};
+                                                           scope, listener_options)};
 }
 
 TimerPtr DispatcherImpl::createTimer(TimerCb cb) { return TimerPtr{new TimerImpl(*this, cb)}; }
@@ -120,11 +122,7 @@ void DispatcherImpl::post(std::function<void()> callback) {
   }
 
   if (do_post) {
-    // If the dispatcher shuts down before this runs, we will leak. This never happens during
-    // normal operation so its not a big deal.
-    event_base_once(base_.get(), -1, EV_TIMEOUT, [](evutil_socket_t, short, void* arg) -> void {
-      static_cast<DispatcherImpl*>(arg)->runPostCallbacks();
-    }, this, nullptr);
+    post_timer_->enableTimer(std::chrono::milliseconds(0));
   }
 }
 

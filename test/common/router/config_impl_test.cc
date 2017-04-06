@@ -127,19 +127,6 @@ TEST(RouteMatcherTest, TestRoutes) {
         {"pattern": "^/users/\\d+$", "method": "PUT", "name": "update_user"},
         {"pattern": "^/users/\\d+/location$", "method": "POST", "name": "ulu"}]
     }
-  ],
-
-  "internal_only_headers": [
-    "x-lyft-user-id"
-  ],
-
-  "response_headers_to_add": [
-    {"key": "x-envoy-upstream-canary", "value": "true"}
-  ],
-
-  "response_headers_to_remove": [
-    "x-envoy-upstream-canary",
-    "x-envoy-virtual-cluster"
   ]
 }
   )EOF";
@@ -147,7 +134,7 @@ TEST(RouteMatcherTest, TestRoutes) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_FALSE(config.usesRuntime());
 
@@ -269,16 +256,6 @@ TEST(RouteMatcherTest, TestRoutes) {
     EXPECT_EQ("new_host", headers.get_(Http::Headers::get().Host));
   }
 
-  // Header manipulaton testing.
-  EXPECT_THAT(std::list<Http::LowerCaseString>{Http::LowerCaseString("x-lyft-user-id")},
-              ContainerEq(config.internalOnlyHeaders()));
-  EXPECT_THAT((std::list<std::pair<Http::LowerCaseString, std::string>>(
-                  {{Http::LowerCaseString("x-envoy-upstream-canary"), "true"}})),
-              ContainerEq(config.responseHeadersToAdd()));
-  EXPECT_THAT(std::list<Http::LowerCaseString>({Http::LowerCaseString("x-envoy-upstream-canary"),
-                                                Http::LowerCaseString("x-envoy-virtual-cluster")}),
-              ContainerEq(config.responseHeadersToRemove()));
-
   // Virtual cluster testing.
   {
     Http::TestHeaderMapImpl headers = genHeaders("api.lyft.com", "/rides", "GET");
@@ -337,6 +314,145 @@ TEST(RouteMatcherTest, TestRoutes) {
   }
 }
 
+TEST(RouteMatcherTest, TestAddRemoveReqRespHeaders) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["lyft.com", "www.lyft.com", "w.lyft.com", "ww.lyft.com", "wwww.lyft.com"],
+      "request_headers_to_add": [
+          {"key": "x-global-header1", "value": "vhost-override"},
+          {"key": "x-vhost-header1", "value": "vhost1-www2"}
+      ],
+      "routes": [
+        {
+          "prefix": "/new_endpoint",
+          "prefix_rewrite": "/api/new_endpoint",
+          "cluster": "www2",
+          "request_headers_to_add": [
+             {"key": "x-global-header1", "value": "route-override"},
+             {"key": "x-vhost-header1", "value": "route-override"},
+             {"key": "x-route-header", "value": "route-new_endpoint"}
+          ]
+        },
+        {
+          "path": "/",
+          "cluster": "root_www2",
+          "request_headers_to_add": [
+             {"key": "x-route-header", "value": "route-allpath"}
+          ]
+        },
+        {
+          "prefix": "/",
+          "cluster": "www2"
+        }
+      ]
+    },
+    {
+      "name": "www2_staging",
+      "domains": ["www-staging.lyft.net", "www-staging-orca.lyft.com"],
+      "request_headers_to_add": [
+          {"key": "x-vhost-header1", "value": "vhost1-www2_staging"}
+      ],
+      "routes": [
+        {
+          "prefix": "/",
+          "cluster": "www2_staging",
+          "request_headers_to_add": [
+             {"key": "x-route-header", "value": "route-allprefix"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "default",
+      "domains": ["*"],
+      "routes": [
+        {
+          "prefix": "/",
+          "cluster": "instant-server",
+          "timeout_ms": 30000
+        }
+      ]
+    }
+  ],
+
+  "internal_only_headers": [
+    "x-lyft-user-id"
+  ],
+
+  "response_headers_to_add": [
+    {"key": "x-envoy-upstream-canary", "value": "true"}
+  ],
+
+  "response_headers_to_remove": [
+    "x-envoy-upstream-canary",
+    "x-envoy-virtual-cluster"
+  ],
+
+  "request_headers_to_add": [
+    {"key": "x-global-header1", "value": "global1"}
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  ConfigImpl config(*loader, runtime, cm, true);
+
+  // Request header manipulation testing.
+  {
+    {
+      Http::TestHeaderMapImpl headers = genHeaders("www.lyft.com", "/new_endpoint/foo", "GET");
+      const RouteEntry* route = config.route(headers, 0)->routeEntry();
+      route->finalizeRequestHeaders(headers);
+      EXPECT_EQ("route-override", headers.get_("x-global-header1"));
+      EXPECT_EQ("route-override", headers.get_("x-vhost-header1"));
+      EXPECT_EQ("route-new_endpoint", headers.get_("x-route-header"));
+    }
+
+    // Multiple routes can have same route-level headers with different values.
+    {
+      Http::TestHeaderMapImpl headers = genHeaders("www.lyft.com", "/", "GET");
+      const RouteEntry* route = config.route(headers, 0)->routeEntry();
+      route->finalizeRequestHeaders(headers);
+      EXPECT_EQ("vhost-override", headers.get_("x-global-header1"));
+      EXPECT_EQ("vhost1-www2", headers.get_("x-vhost-header1"));
+      EXPECT_EQ("route-allpath", headers.get_("x-route-header"));
+    }
+
+    // Multiple virtual hosts can have same virtual host level headers with different values.
+    {
+      Http::TestHeaderMapImpl headers = genHeaders("www-staging.lyft.net", "/foo", "GET");
+      const RouteEntry* route = config.route(headers, 0)->routeEntry();
+      route->finalizeRequestHeaders(headers);
+      EXPECT_EQ("global1", headers.get_("x-global-header1"));
+      EXPECT_EQ("vhost1-www2_staging", headers.get_("x-vhost-header1"));
+      EXPECT_EQ("route-allprefix", headers.get_("x-route-header"));
+    }
+
+    // Global headers.
+    {
+      Http::TestHeaderMapImpl headers = genHeaders("api.lyft.com", "/", "GET");
+      const RouteEntry* route = config.route(headers, 0)->routeEntry();
+      route->finalizeRequestHeaders(headers);
+      EXPECT_EQ("global1", headers.get_("x-global-header1"));
+    }
+  }
+
+  // Response header manipulation testing.
+  EXPECT_THAT(std::list<Http::LowerCaseString>{Http::LowerCaseString("x-lyft-user-id")},
+              ContainerEq(config.internalOnlyHeaders()));
+  EXPECT_THAT((std::list<std::pair<Http::LowerCaseString, std::string>>(
+                  {{Http::LowerCaseString("x-envoy-upstream-canary"), "true"}})),
+              ContainerEq(config.responseHeadersToAdd()));
+  EXPECT_THAT(std::list<Http::LowerCaseString>({Http::LowerCaseString("x-envoy-upstream-canary"),
+                                                Http::LowerCaseString("x-envoy-virtual-cluster")}),
+              ContainerEq(config.responseHeadersToRemove()));
+}
+
 TEST(RouteMatcherTest, InvalidPriority) {
   std::string json = R"EOF(
 {
@@ -359,7 +475,7 @@ TEST(RouteMatcherTest, InvalidPriority) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  EXPECT_THROW(ConfigImpl(*loader, runtime, cm), EnvoyException);
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
 }
 
 TEST(RouteMatcherTest, Priority) {
@@ -390,7 +506,7 @@ TEST(RouteMatcherTest, Priority) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_FALSE(config.usesRuntime());
 
@@ -410,6 +526,32 @@ TEST(RouteMatcherTest, Priority) {
     EXPECT_EQ(Upstream::ResourcePriority::Default,
               config.route(headers, 0)->routeEntry()->virtualCluster(headers)->priority());
   }
+}
+
+TEST(RouteMatcherTest, NoHostRewriteAndAutoRewrite) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "local_service",
+      "domains": ["*"],
+      "routes": [
+        {
+          "prefix": "/",
+          "cluster": "local_service",
+          "host_rewrite": "foo",
+          "auto_host_rewrite" : true
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
 }
 
 TEST(RouteMatcherTest, HeaderMatchedRouting) {
@@ -469,7 +611,7 @@ TEST(RouteMatcherTest, HeaderMatchedRouting) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_FALSE(config.usesRuntime());
 
@@ -521,6 +663,112 @@ TEST(RouteMatcherTest, HeaderMatchedRouting) {
   }
 }
 
+TEST(RouterMatcherTest, HashPolicy) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "local_service",
+      "domains": ["*"],
+      "routes": [
+        {
+          "prefix": "/foo",
+          "cluster": "foo",
+          "hash_policy": {
+            "header_name": "foo_header"
+          }
+        },
+        {
+          "prefix": "/bar",
+          "cluster": "bar"
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  ConfigImpl config(*loader, runtime, cm, true);
+
+  EXPECT_FALSE(config.usesRuntime());
+
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www.lyft.com", "/foo", "GET");
+    Router::RouteConstSharedPtr route = config.route(headers, 0);
+    EXPECT_FALSE(route->routeEntry()->hashPolicy()->generateHash(headers).valid());
+  }
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www.lyft.com", "/foo", "GET");
+    headers.addViaCopy("foo_header", "bar");
+    Router::RouteConstSharedPtr route = config.route(headers, 0);
+    EXPECT_TRUE(route->routeEntry()->hashPolicy()->generateHash(headers).valid());
+  }
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www.lyft.com", "/bar", "GET");
+    Router::RouteConstSharedPtr route = config.route(headers, 0);
+    EXPECT_EQ(nullptr, route->routeEntry()->hashPolicy());
+  }
+}
+
+TEST(RouteMatcherTest, ClusterHeader) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "local_service",
+      "domains": ["*"],
+      "routes": [
+        {
+          "prefix": "/foo",
+          "cluster_header": ":authority"
+        },
+        {
+          "prefix": "/bar",
+          "cluster_header": "some_header",
+          "timeout_ms": 0
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  ConfigImpl config(*loader, runtime, cm, true);
+
+  EXPECT_FALSE(config.usesRuntime());
+
+  EXPECT_EQ(
+      "some_cluster",
+      config.route(genHeaders("some_cluster", "/foo", "GET"), 0)->routeEntry()->clusterName());
+
+  EXPECT_EQ(
+      "", config.route(genHeaders("www.lyft.com", "/bar", "GET"), 0)->routeEntry()->clusterName());
+
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www.lyft.com", "/bar", "GET");
+    headers.addViaCopy("some_header", "some_cluster");
+    Router::RouteConstSharedPtr route = config.route(headers, 0);
+    EXPECT_EQ("some_cluster", route->routeEntry()->clusterName());
+
+    // Make sure things forward and don't crash.
+    EXPECT_EQ(std::chrono::milliseconds(0), route->routeEntry()->timeout());
+    route->routeEntry()->finalizeRequestHeaders(headers);
+    route->routeEntry()->priority();
+    route->routeEntry()->rateLimitPolicy();
+    route->routeEntry()->retryPolicy();
+    route->routeEntry()->shadowPolicy();
+    route->routeEntry()->virtualCluster(headers);
+    route->routeEntry()->virtualHost();
+    route->routeEntry()->virtualHost().rateLimitPolicy();
+  }
+}
+
 TEST(RouteMatcherTest, ContentType) {
   std::string json = R"EOF(
 {
@@ -549,7 +797,7 @@ TEST(RouteMatcherTest, ContentType) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_FALSE(config.usesRuntime());
 
@@ -604,7 +852,7 @@ TEST(RouteMatcherTest, Runtime) {
 
   ON_CALL(runtime, snapshot()).WillByDefault(ReturnRef(snapshot));
 
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_TRUE(config.usesRuntime());
 
@@ -641,10 +889,62 @@ TEST(RouteMatcherTest, ShadowClusterNotFound) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  EXPECT_CALL(cm, get("www2")).WillRepeatedly(Return(cm.cluster_.info_));
+  EXPECT_CALL(cm, get("www2")).WillRepeatedly(Return(&cm.thread_local_cluster_));
   EXPECT_CALL(cm, get("some_cluster")).WillRepeatedly(Return(nullptr));
 
-  EXPECT_THROW(ConfigImpl(*loader, runtime, cm), EnvoyException);
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, ClusterNotFound) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/foo",
+          "cluster": "www2"
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_CALL(cm, get("www2")).WillRepeatedly(Return(nullptr));
+
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, ClusterNotFoundNotChecking) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/foo",
+          "cluster": "www2"
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_CALL(cm, get("www2")).WillRepeatedly(Return(nullptr));
+
+  ConfigImpl(*loader, runtime, cm, false);
 }
 
 TEST(RouteMatcherTest, Shadow) {
@@ -683,7 +983,7 @@ TEST(RouteMatcherTest, Shadow) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_TRUE(config.usesRuntime());
 
@@ -751,7 +1051,7 @@ TEST(RouteMatcherTest, Retry) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_FALSE(config.usesRuntime());
 
@@ -820,7 +1120,7 @@ TEST(RouteMatcherTest, TestBadDefaultConfig) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  EXPECT_THROW(ConfigImpl config(*loader, runtime, cm), EnvoyException);
+  EXPECT_THROW(ConfigImpl config(*loader, runtime, cm, true), EnvoyException);
 }
 
 TEST(RouteMatcherTest, TestDuplicateDomainConfig) {
@@ -854,7 +1154,7 @@ TEST(RouteMatcherTest, TestDuplicateDomainConfig) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  EXPECT_THROW(ConfigImpl config(*loader, runtime, cm), EnvoyException);
+  EXPECT_THROW(ConfigImpl config(*loader, runtime, cm, true), EnvoyException);
 }
 
 static Http::TestHeaderMapImpl genRedirectHeaders(const std::string& host, const std::string& path,
@@ -920,7 +1220,7 @@ TEST(RouteMatcherTest, Redirect) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   EXPECT_FALSE(config.usesRuntime());
 
@@ -932,8 +1232,8 @@ TEST(RouteMatcherTest, Redirect) {
   }
   {
     Http::TestHeaderMapImpl headers = genRedirectHeaders("www.lyft.com", "/foo", false, false);
-    const Route* route = config.route(headers, 0);
-    EXPECT_EQ("https://www.lyft.com/foo", route->redirectEntry()->newPath(headers));
+    EXPECT_EQ("https://www.lyft.com/foo",
+              config.route(headers, 0)->redirectEntry()->newPath(headers));
   }
   {
     Http::TestHeaderMapImpl headers = genRedirectHeaders("api.lyft.com", "/foo", false, true);
@@ -992,7 +1292,7 @@ TEST(RouteMatcherTest, ExclusiveRouteEntryOrRedirectEntry) {
   Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
   NiceMock<Runtime::MockLoader> runtime;
   NiceMock<Upstream::MockClusterManager> cm;
-  ConfigImpl config(*loader, runtime, cm);
+  ConfigImpl config(*loader, runtime, cm, true);
 
   {
     Http::TestHeaderMapImpl headers = genRedirectHeaders("www.lyft.com", "/foo", true, true);
@@ -1007,6 +1307,328 @@ TEST(RouteMatcherTest, ExclusiveRouteEntryOrRedirectEntry) {
   }
 }
 
+TEST(RouteMatcherTest, ExclusiveWeightedClustersEntryOrRedirectEntry) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+           "clusters" : [{ "name" : "www2", "weight" : 100 }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "redirect",
+      "domains": ["redirect.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/foo",
+          "host_redirect": "new.lyft.com"
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  ConfigImpl config(*loader, runtime, cm, true);
+
+  {
+    Http::TestHeaderMapImpl headers = genRedirectHeaders("www.lyft.com", "/foo", true, true);
+    EXPECT_EQ(nullptr, config.route(headers, 0)->redirectEntry());
+    EXPECT_EQ("www2", config.route(headers, 0)->routeEntry()->clusterName());
+  }
+
+  {
+    Http::TestHeaderMapImpl headers = genRedirectHeaders("redirect.lyft.com", "/foo", false, false);
+    EXPECT_EQ("http://new.lyft.com/foo",
+              config.route(headers, 0)->redirectEntry()->newPath(headers));
+    EXPECT_EQ(nullptr, config.route(headers, 0)->routeEntry());
+  }
+}
+
+TEST(RouteMatcherTest, WeightedClusters) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www1",
+      "domains": ["www1.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "clusters" : [
+              { "name" : "cluster1", "weight" : 30 },
+              { "name" : "cluster2", "weight" : 30 },
+              { "name" : "cluster3", "weight" : 40 }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "www2",
+      "domains": ["www2.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "runtime_key_prefix" : "www2_weights",
+            "clusters" : [
+              { "name" : "cluster1", "weight" : 30 },
+              { "name" : "cluster2", "weight" : 30 },
+              { "name" : "cluster3", "weight" : 40 }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  ConfigImpl config(*loader, runtime, cm, true);
+
+  {
+    Http::TestHeaderMapImpl headers = genRedirectHeaders("www1.lyft.com", "/foo", true, true);
+    EXPECT_EQ(nullptr, config.route(headers, 0)->redirectEntry());
+  }
+
+  // Weighted Cluster with no runtime
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www1.lyft.com", "/foo", "GET");
+    EXPECT_EQ("cluster1", config.route(headers, 115)->routeEntry()->clusterName());
+    EXPECT_EQ("cluster2", config.route(headers, 445)->routeEntry()->clusterName());
+    EXPECT_EQ("cluster3", config.route(headers, 560)->routeEntry()->clusterName());
+  }
+
+  // Weighted Cluster with valid runtime values
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www2.lyft.com", "/foo", "GET");
+    EXPECT_CALL(runtime.snapshot_, featureEnabled("www2", 100, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(runtime.snapshot_, getInteger("www2_weights.cluster1", 30))
+        .WillRepeatedly(Return(80));
+    EXPECT_CALL(runtime.snapshot_, getInteger("www2_weights.cluster2", 30))
+        .WillRepeatedly(Return(10));
+    EXPECT_CALL(runtime.snapshot_, getInteger("www2_weights.cluster3", 40))
+        .WillRepeatedly(Return(10));
+
+    EXPECT_EQ("cluster1", config.route(headers, 45)->routeEntry()->clusterName());
+    EXPECT_EQ("cluster2", config.route(headers, 82)->routeEntry()->clusterName());
+    EXPECT_EQ("cluster3", config.route(headers, 92)->routeEntry()->clusterName());
+  }
+
+  // Weighted Cluster with invalid runtime values
+  {
+    Http::TestHeaderMapImpl headers = genHeaders("www2.lyft.com", "/foo", "GET");
+    EXPECT_CALL(runtime.snapshot_, featureEnabled("www2", 100, _)).WillRepeatedly(Return(true));
+    EXPECT_CALL(runtime.snapshot_, getInteger("www2_weights.cluster1", 30))
+        .WillRepeatedly(Return(10));
+
+    // We return an invalid value here, one that is greater than 100
+    // Expect any random value > 10 to always land in cluster2.
+    EXPECT_CALL(runtime.snapshot_, getInteger("www2_weights.cluster2", 30))
+        .WillRepeatedly(Return(120));
+    EXPECT_CALL(runtime.snapshot_, getInteger("www2_weights.cluster3", 40))
+        .WillRepeatedly(Return(10));
+
+    EXPECT_EQ("cluster1", config.route(headers, 1005)->routeEntry()->clusterName());
+    EXPECT_EQ("cluster2", config.route(headers, 82)->routeEntry()->clusterName());
+    EXPECT_EQ("cluster2", config.route(headers, 92)->routeEntry()->clusterName());
+  }
+}
+
+TEST(RouteMatcherTest, ExclusiveWeightedClustersOrClusterConfig) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "clusters" : [
+              { "name" : "cluster1", "weight" : 30 },
+              { "name" : "cluster2", "weight" : 30 },
+              { "name" : "cluster3", "weight" : 40 }
+            ]
+          },
+          "cluster" : "www2"
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, WeightedClustersMissingClusterList) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "runtime_key_prefix" : "www2"
+          }
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, WeightedClustersEmptyClustersList) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "runtime_key_prefix" : "www2",
+            "clusters" : []
+          }
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, WeightedClustersSumOFWeightsNotEqualToMax) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "clusters" : [
+              { "name" : "cluster1", "weight" : 3 },
+              { "name" : "cluster2", "weight" : 3 },
+              { "name" : "cluster3", "weight" : 3 }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, TestWeightedClusterWithMissingWeights) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/",
+          "weighted_clusters": {
+            "clusters" : [
+              { "name" : "cluster1", "weight" : 50 },
+              { "name" : "cluster2", "weight" : 50 },
+              { "name" : "cluster3"}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, TestWeightedClusterInvalidClusterName) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "www2",
+      "domains": ["www.lyft.com"],
+      "routes": [
+        {
+          "prefix": "/foo",
+          "weighted_clusters": {
+            "clusters" : [
+              { "name" : "cluster1", "weight" : 33 },
+              { "name" : "cluster2", "weight" : 33 },
+              { "name" : "cluster3-invalid", "weight": 34}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  EXPECT_CALL(cm, get("cluster1")).WillRepeatedly(Return(&cm.thread_local_cluster_));
+  EXPECT_CALL(cm, get("cluster2")).WillRepeatedly(Return(&cm.thread_local_cluster_));
+  EXPECT_CALL(cm, get("cluster3-invalid")).WillRepeatedly(Return(nullptr));
+
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
 TEST(NullConfigImplTest, All) {
   NullConfigImpl config;
   Http::TestHeaderMapImpl headers = genRedirectHeaders("redirect.lyft.com", "/baz", true, false);
@@ -1015,6 +1637,153 @@ TEST(NullConfigImplTest, All) {
   EXPECT_EQ(0UL, config.responseHeadersToAdd().size());
   EXPECT_EQ(0UL, config.responseHeadersToRemove().size());
   EXPECT_FALSE(config.usesRuntime());
+}
+
+TEST(BadHttpRouteConfigurationsTest, BadRouteConfig) {
+  std::string json = R"EOF(
+  {
+    "virtual_hosts": [
+      {
+        "name": "www2",
+        "domains": ["*"],
+        "routes": [
+          {
+            "prefix": "/",
+            "cluster": "www2"
+          }
+        ]
+      }
+    ],
+    "fake_entry" : "fake_type"
+  }
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(BadHttpRouteConfigurationsTest, BadVirtualHostConfig) {
+  std::string json = R"EOF(
+  {
+    "virtual_hosts": [
+      {
+        "name": "www2",
+        "domains": ["*"],
+        "router" : {
+          "cluster" : "my_cluster"
+        },
+        "routes": [
+          {
+            "prefix": "/",
+            "cluster": "www2"
+          }
+        ]
+      }
+    ]
+  }
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(BadHttpRouteConfigurationsTest, BadRouteEntryConfig) {
+  std::string json = R"EOF(
+  {
+    "virtual_hosts": [
+      {
+        "name": "www2",
+        "domains": ["*"],
+        "routes": [
+          {
+            "prefix": "/",
+            "cluster": "www2",
+            "timeout_ms" : "1234"
+          }
+        ]
+      }
+    ]
+  }
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(BadHttpRouteConfigurationsTest, BadRouteEntryConfigPrefixAndPath) {
+  std::string json = R"EOF(
+  {
+    "virtual_hosts": [
+      {
+        "name": "www2",
+        "domains": ["*"],
+        "routes": [
+          {
+            "prefix": "/",
+            "path": "/foo",
+            "cluster": "www2"
+          }
+        ]
+      }
+    ]
+  }
+  )EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+
+  EXPECT_THROW(ConfigImpl(*loader, runtime, cm, true), EnvoyException);
+}
+
+TEST(RouteMatcherTest, TestOpaqueConfig) {
+  std::string json = R"EOF(
+{
+  "virtual_hosts": [
+    {
+      "name": "default",
+      "domains": ["*"],
+      "routes": [
+        {
+          "prefix": "/api",
+          "cluster": "ats",
+          "opaque_config" : {
+              "name1": "value1",
+              "name2": "value2",
+              "name1": "value3"
+          }
+        }
+      ]
+    }
+  ]
+}
+)EOF";
+
+  Json::ObjectPtr loader = Json::Factory::LoadFromString(json);
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Upstream::MockClusterManager> cm;
+  ConfigImpl config(*loader, runtime, cm, true);
+
+  const std::multimap<std::string, std::string>& opaque_config =
+      config.route(genHeaders("api.lyft.com", "/api", "GET"), 0)->routeEntry()->opaqueConfig();
+
+  EXPECT_EQ(2u, opaque_config.count("name1"));
+  auto range = opaque_config.equal_range("name1");
+  auto it = range.first;
+  EXPECT_EQ("value1", it->second);
+  ++it;
+  EXPECT_EQ("value3", it->second);
+
+  EXPECT_EQ("value2", opaque_config.find("name2")->second);
 }
 
 } // Router

@@ -5,6 +5,7 @@
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/ratelimit/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/mocks/tracing/mocks.h"
 
 using testing::_;
 using testing::InSequence;
@@ -43,19 +44,33 @@ public:
   }
 
   ~RateLimitFilterTest() {
-    for (Stats::Gauge& gauge : stats_store_.gauges()) {
-      EXPECT_EQ(0U, gauge.value());
+    for (Stats::GaugeSharedPtr gauge : stats_store_.gauges()) {
+      EXPECT_EQ(0U, gauge->value());
     }
   }
 
   Stats::IsolatedStoreImpl stats_store_;
   NiceMock<Runtime::MockLoader> runtime_;
-  ConfigPtr config_;
+  ConfigSharedPtr config_;
   MockClient* client_;
   std::unique_ptr<Instance> filter_;
   NiceMock<Network::MockReadFilterCallbacks> filter_callbacks_;
   RequestCallbacks* request_callbacks_{};
 };
+
+TEST_F(RateLimitFilterTest, BadRatelimitConfig) {
+  std::string json_string = R"EOF(
+  {
+    "stat_prefix": "my_stat_prefix",
+    "domain" : "fake_domain",
+    "descriptors": [[{ "key" : "my_key",  "value" : "my_value" }]],
+    "ip_white_list": "12"
+  }
+  )EOF";
+
+  Json::ObjectPtr json_config = Json::Factory::LoadFromString(json_string);
+  EXPECT_THROW(Config(*json_config, stats_store_, runtime_), Json::Exception);
+}
 
 TEST_F(RateLimitFilterTest, OK) {
   InSequence s;
@@ -63,7 +78,7 @@ TEST_F(RateLimitFilterTest, OK) {
   EXPECT_CALL(*client_,
               limit(_, "foo", testing::ContainerEq(std::vector<Descriptor>{
                                   {{{"hello", "world"}, {"foo", "bar"}}}, {{{"foo2", "bar2"}}}}),
-                    ""))
+                    Tracing::EMPTY_CONTEXT))
       .WillOnce(WithArgs<0>(
           Invoke([&](RequestCallbacks& callbacks) -> void { request_callbacks_ = &callbacks; })));
 

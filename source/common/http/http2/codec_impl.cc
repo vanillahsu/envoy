@@ -1,13 +1,17 @@
-#include "codec_impl.h"
+#include "common/http/http2/codec_impl.h"
 
 #include "envoy/event/dispatcher.h"
+#include "envoy/http/codes.h"
 #include "envoy/http/header_map.h"
 #include "envoy/network/connection.h"
 
 #include "common/common/assert.h"
+#include "common/common/enum_to_int.h"
 #include "common/common/utility.h"
+#include "common/http/codes.h"
 #include "common/http/exception.h"
 #include "common/http/headers.h"
+#include "common/http/utility.h"
 
 namespace Http {
 namespace Http2 {
@@ -27,6 +31,10 @@ bool Utility::reconstituteCrumbledCookies(const HeaderString& key, const HeaderS
 }
 
 ConnectionImpl::Http2Callbacks ConnectionImpl::http2_callbacks_;
+ConnectionImpl::Http2Options ConnectionImpl::http2_options_;
+const std::unique_ptr<const Http::HeaderMap> ConnectionImpl::CONTINUE_HEADER{
+    new Http::HeaderMapImpl{
+        {Http::Headers::get().Status, std::to_string(enumToInt(Code::Continue))}}};
 
 /**
  * Helper to remove const during a cast. nghttp2 takes non-const pointers for headers even though
@@ -37,7 +45,9 @@ template <typename T> static T* remove_const(const void* object) {
 }
 
 ConnectionImpl::StreamImpl::StreamImpl(ConnectionImpl& parent)
-    : parent_(parent), headers_(new HeaderMapImpl()) {}
+    : parent_(parent), headers_(new HeaderMapImpl()), local_end_stream_(false),
+      local_end_stream_sent_(false), remote_end_stream_(false), data_deferred_(false),
+      waiting_for_non_informational_headers_(false) {}
 
 ConnectionImpl::StreamImpl::~StreamImpl() {}
 
@@ -113,7 +123,7 @@ void ConnectionImpl::StreamImpl::submitTrailers(const HeaderMap& trailers) {
   UNREFERENCED_PARAMETER(rc);
 }
 
-ssize_t ConnectionImpl::StreamImpl::onDataSourceRead(size_t length, uint32_t* data_flags) {
+ssize_t ConnectionImpl::StreamImpl::onDataSourceRead(uint64_t length, uint32_t* data_flags) {
   if (pending_send_data_.length() == 0 && !local_end_stream_) {
     ASSERT(!data_deferred_);
     data_deferred_ = true;
@@ -140,7 +150,7 @@ int ConnectionImpl::StreamImpl::onDataSourceSend(const uint8_t* framehd, size_t 
   // https://nghttp2.org/documentation/types.html#c.nghttp2_send_data_callback
   static const uint64_t FRAME_HEADER_SIZE = 9;
 
-  // TODO: Back pressure.
+  // TODO(mattklein123): Back pressure.
   Buffer::OwnedImpl output(framehd, FRAME_HEADER_SIZE);
   output.move(pending_send_data_, length);
   parent_.connection_.write(output);
@@ -187,6 +197,7 @@ void ConnectionImpl::StreamImpl::resetStream(StreamResetReason reason) {
   // We want these frames to go out so we defer the reset until we send all of the frames that
   // end the local stream.
   if (local_end_stream_ && !local_end_stream_sent_) {
+    parent_.pending_deferred_reset_ = true;
     deferred_reset_.value(reason);
   } else {
     resetStreamWorker(reason);
@@ -280,17 +291,63 @@ int ConnectionImpl::onFrameReceived(const nghttp2_frame* frame) {
       stream->headers_->addViaMove(std::move(key), std::move(stream->cookies_));
     }
 
-    if (frame->headers.cat == NGHTTP2_HCAT_REQUEST || frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
-      stream->decoder_->decodeHeaders(std::move(stream->headers_), stream->remote_end_stream_);
-    } else {
-      ASSERT(frame->headers.cat == NGHTTP2_HCAT_HEADERS);
-      ASSERT(stream->remote_end_stream_);
+    if (frame->headers.cat == NGHTTP2_HCAT_REQUEST && stream->headers_->Expect() &&
+        0 == StringUtil::caseInsensitiveCompare(stream->headers_->Expect()->value().c_str(),
+                                                Headers::get().ExpectValues._100Continue.c_str())) {
+      // Deal with expect: 100-continue here since higher layers are never going to do anything
+      // other than say to continue so that we can respond before request complete if necessary.
+      std::vector<nghttp2_nv> final_headers;
+      StreamImpl::buildHeaders(final_headers, *CONTINUE_HEADER);
+      int rc = nghttp2_submit_headers(session_, 0, stream->stream_id_, nullptr, &final_headers[0],
+                                      final_headers.size(), nullptr);
+      ASSERT(rc == 0);
+      UNREFERENCED_PARAMETER(rc);
 
-      // It's possible that we are waiting to send a deferred reset, so only raise trailers if local
-      // is not complete.
-      if (!stream->deferred_reset_.valid()) {
-        stream->decoder_->decodeTrailers(std::move(stream->headers_));
+      stream->headers_->removeExpect();
+    }
+
+    switch (frame->headers.cat) {
+    case NGHTTP2_HCAT_RESPONSE: {
+      if (CodeUtility::is1xx(Http::Utility::getResponseStatus(*stream->headers_))) {
+        stream->waiting_for_non_informational_headers_ = true;
       }
+
+      // Fall through.
+    }
+
+    case NGHTTP2_HCAT_REQUEST: {
+      stream->decoder_->decodeHeaders(std::move(stream->headers_), stream->remote_end_stream_);
+      break;
+    }
+
+    case NGHTTP2_HCAT_HEADERS: {
+      // It's possible that we are waiting to send a deferred reset, so only raise headers/trailers
+      // if local is not complete.
+      if (!stream->deferred_reset_.valid()) {
+        if (!stream->waiting_for_non_informational_headers_) {
+          ASSERT(stream->remote_end_stream_);
+          stream->decoder_->decodeTrailers(std::move(stream->headers_));
+        } else {
+          ASSERT(!nghttp2_session_check_server_session(session_));
+          stream->waiting_for_non_informational_headers_ = false;
+
+          // This can only happen in the client case in a response, when we received a 1xx to
+          // start out with. In this case, raise as headers. nghttp2 message checking guarantees
+          // proper flow here.
+          // TODO(mattklein123): Higher layers don't currently deal with a double decodeHeaders()
+          // call and will probably crash. We do this in the client path for testing when the server
+          // responds with 1xx. In the future, if needed, we can properly handle 1xx in higher layer
+          // code, or just eat it.
+          stream->decoder_->decodeHeaders(std::move(stream->headers_), stream->remote_end_stream_);
+        }
+      }
+
+      break;
+    }
+
+    default:
+      // We do not currently support push.
+      NOT_IMPLEMENTED;
     }
 
     stream->headers_.reset();
@@ -342,9 +399,6 @@ int ConnectionImpl::onFrameSend(const nghttp2_frame* frame) {
   case NGHTTP2_DATA: {
     StreamImpl* stream = getStream(frame->hd.stream_id);
     stream->local_end_stream_sent_ = frame->hd.flags & NGHTTP2_FLAG_END_STREAM;
-    if (stream->local_end_stream_sent_ && stream->deferred_reset_.valid()) {
-      stream->resetStreamWorker(stream->deferred_reset_.value());
-    }
     break;
   }
   }
@@ -361,7 +415,7 @@ int ConnectionImpl::onInvalidFrame(int error_code) {
 }
 
 ssize_t ConnectionImpl::onSend(const uint8_t* data, size_t length) {
-  // TODO: Back pressure.
+  // TODO(mattklein123): Back pressure.
   conn_log_trace("send data: bytes={}", connection_, length);
   Buffer::OwnedImpl buffer(data, length);
   connection_.write(buffer);
@@ -396,7 +450,7 @@ int ConnectionImpl::saveHeader(const nghttp2_frame* frame, HeaderString&& name,
     // code it looks possible that inflate_header_block() can safely inflate headers for an already
     // closed stream, but will still call the headers callback. Since that seems possible, we should
     // ignore this case here.
-    // TODO: Figure out a test case that can hit this.
+    // TODO(mattklein123): Figure out a test case that can hit this.
     stats_.headers_cb_no_stream_.inc();
     return 0;
   }
@@ -420,6 +474,28 @@ void ConnectionImpl::sendPendingFrames() {
   if (rc != 0) {
     ASSERT(rc == NGHTTP2_ERR_CALLBACK_FAILURE);
     throw CodecProtocolException(fmt::format("{}", nghttp2_strerror(rc)));
+  }
+
+  // See ConnectionImpl::StreamImpl::resetStream() for why we do this. This is an uncommon event,
+  // so iterating through every stream to find the ones that have a deferred reset is not a big
+  // deal. Furthermore, queueing a reset frame does not actually invoke the close stream callback.
+  // This is only done when the reset frame is sent. Thus, it's safe to work directly with the
+  // stream map.
+  // NOTE: The way we handle deferred reset is essentially best effort. If we intend to do a
+  //       deferred reset, we try to finish the stream, including writing any pending data frames.
+  //       If we cannot do this (potentially due to not enough window), we just reset the stream.
+  //       In general this behavior occurs only when we are trying to send immediate error messages
+  //       to short circuit requests. In the best effort case, we complete the stream before
+  //       resetting. In other cases, we just do the reset now which will blow away pending data
+  //       frames and release any memory associated with the stream.
+  if (pending_deferred_reset_) {
+    pending_deferred_reset_ = false;
+    for (auto& stream : active_streams_) {
+      if (stream->deferred_reset_.valid()) {
+        stream->resetStreamWorker(stream->deferred_reset_.value());
+      }
+    }
+    sendPendingFrames();
   }
 }
 
@@ -514,11 +590,23 @@ ConnectionImpl::Http2Callbacks::Http2Callbacks() {
 
 ConnectionImpl::Http2Callbacks::~Http2Callbacks() { nghttp2_session_callbacks_del(callbacks_); }
 
+ConnectionImpl::Http2Options::Http2Options() {
+  nghttp2_option_new(&options_);
+  // Currently we do not do anything with stream priority. Setting the following option prevents
+  // nghttp2 from keeping around closed streams for use during stream priority dependency graph
+  // calculations. This saves a tremendous amount of memory in cases where there are a large number
+  // of kept alive http/2 connections.
+  nghttp2_option_set_no_closed_streams(options_, 1);
+}
+
+ConnectionImpl::Http2Options::~Http2Options() { nghttp2_option_del(options_); }
+
 ClientConnectionImpl::ClientConnectionImpl(Network::Connection& connection,
                                            ConnectionCallbacks& callbacks, Stats::Scope& stats,
                                            uint64_t codec_options)
     : ConnectionImpl(connection, stats), callbacks_(callbacks) {
-  nghttp2_session_client_new(&session_, http2_callbacks_.callbacks(), base());
+  nghttp2_session_client_new2(&session_, http2_callbacks_.callbacks(), base(),
+                              http2_options_.options());
   sendSettings(codec_options);
 }
 
@@ -555,7 +643,8 @@ ServerConnectionImpl::ServerConnectionImpl(Network::Connection& connection,
                                            Http::ServerConnectionCallbacks& callbacks,
                                            Stats::Store& stats, uint64_t codec_options)
     : ConnectionImpl(connection, stats), callbacks_(callbacks) {
-  nghttp2_session_server_new(&session_, http2_callbacks_.callbacks(), base());
+  nghttp2_session_server_new2(&session_, http2_callbacks_.callbacks(), base(),
+                              http2_options_.options());
   sendSettings(codec_options);
 }
 

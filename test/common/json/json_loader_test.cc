@@ -10,6 +10,7 @@ TEST(JsonLoaderTest, Basic) {
     ObjectPtr json = Factory::LoadFromString("{\"hello\":123}");
     EXPECT_TRUE(json->hasObject("hello"));
     EXPECT_FALSE(json->hasObject("world"));
+    EXPECT_FALSE(json->empty());
     EXPECT_THROW(json->getObject("world"), Exception);
     EXPECT_THROW(json->getBoolean("hello"), Exception);
     EXPECT_THROW(json->getObjectArray("hello"), Exception);
@@ -114,6 +115,7 @@ TEST(JsonLoaderTest, Basic) {
     ObjectPtr config = Factory::LoadFromString(json);
     ObjectPtr object = config->getObject("foo", true);
     EXPECT_EQ(2, object->getInteger("bar", 2));
+    EXPECT_TRUE(object->empty());
   }
 }
 
@@ -155,6 +157,69 @@ TEST(JsonLoaderTest, Hash) {
   ObjectPtr json3 = Factory::LoadFromString("  {  \"value2\":  -12.3, \"value1\":  10.5} ");
   EXPECT_NE(json1->hash(), json2->hash());
   EXPECT_EQ(json2->hash(), json3->hash());
+}
+
+TEST(JsonLoaderTest, Schema) {
+  std::string invalid_json_schema = R"EOF(
+  {
+    "properties": {"value1"}
+  }
+  )EOF";
+
+  std::string invalid_schema = R"EOF(
+  {
+    "properties" : {
+      "value1": {"type" : "faketype"}
+    }
+  }
+  )EOF";
+
+  std::string different_schema = R"EOF(
+  {
+    "properties" : {
+      "value1" : {"type" : "number"}
+    },
+    "additionalProperties" : false
+  }
+  )EOF";
+
+  std::string valid_schema = R"EOF(
+  {
+    "properties": {
+      "value1": {"type" : "number"},
+      "value2": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+  )EOF";
+
+  std::string json_string = R"EOF(
+  {
+    "value1": 10,
+    "value2" : "test"
+  }
+  )EOF";
+
+  ObjectPtr json = Factory::LoadFromString(json_string);
+
+  EXPECT_THROW(json->validateSchema(invalid_json_schema), std::invalid_argument);
+  EXPECT_THROW(json->validateSchema(invalid_schema), Exception);
+  EXPECT_THROW(json->validateSchema(different_schema), Exception);
+  EXPECT_NO_THROW(json->validateSchema(valid_schema));
+}
+
+TEST(JsonLoaderTest, AsString) {
+  ObjectPtr json = Factory::LoadFromString("{\"name1\": \"value1\", \"name2\": true}");
+  json->iterate([&](const std::string& key, const Json::Object& value) {
+    EXPECT_TRUE(key == "name1" || key == "name2");
+
+    if (key == "name1") {
+      EXPECT_EQ("value1", value.asString());
+    } else {
+      EXPECT_THROW(value.asString(), Exception);
+    }
+    return true;
+  });
 }
 
 } // Json

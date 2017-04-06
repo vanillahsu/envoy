@@ -23,9 +23,9 @@ public:
   virtual Network::FilterChainFactory& filterChainFactory() PURE;
 
   /**
-   * @return uint64_t the port.
+   * @return Network::Address::InstanceConstSharedPtr the address.
    */
-  virtual uint64_t port() PURE;
+  virtual Network::Address::InstanceConstSharedPtr address() PURE;
 
   /**
    * @return Ssl::ServerContext* the SSL context
@@ -46,10 +46,21 @@ public:
   virtual bool bindToPort() PURE;
 
   /**
-   * @return bool if a connection was redirected to this listener port using iptables,
-   *         allow the listener to hand it off to the listener associated to the original port
+   * @return bool if a connection was redirected to this listener address using iptables,
+   *         allow the listener to hand it off to the listener associated to the original address
    */
   virtual bool useOriginalDst() PURE;
+
+  /**
+   * @return uint32_t providing a soft limit on size of the listener's new connection read and write
+   *         buffers.
+   */
+  virtual uint32_t perConnectionBufferLimitBytes() PURE;
+
+  /**
+   * @return Stats::Scope& the stats scope to use for all listener specific stats.
+   */
+  virtual Stats::Scope& scope() PURE;
 };
 
 typedef std::unique_ptr<Listener> ListenerPtr;
@@ -117,10 +128,34 @@ public:
   virtual Optional<uint32_t> statsdUdpPort() PURE;
 
   /**
-   * @return the time interval between flushing to configured stat sinks. The server latches
-   *         counters.
+   * @return std::chrono::milliseconds the time interval between flushing to configured stat sinks.
+   *         The server latches counters.
    */
   virtual std::chrono::milliseconds statsFlushInterval() PURE;
+
+  /**
+   * @return std::chrono::milliseconds the time interval after which we count a nonresponsive thread
+   *         event as a "miss" statistic.
+   */
+  virtual std::chrono::milliseconds wdMissTimeout() const PURE;
+
+  /**
+   * @return std::chrono::milliseconds the time interval after which we count a nonresponsive thread
+   *         event as a "mega miss" statistic.
+   */
+  virtual std::chrono::milliseconds wdMegaMissTimeout() const PURE;
+
+  /**
+   * @return std::chrono::milliseconds the time interval after which we kill the process due to a
+   *         single nonresponsive thread.
+   */
+  virtual std::chrono::milliseconds wdKillTimeout() const PURE;
+
+  /**
+   * @return std::chrono::milliseconds the time interval after which we kill the process due to
+   *         multiple nonresponsive threads.
+   */
+  virtual std::chrono::milliseconds wdMultiKillTimeout() const PURE;
 };
 
 /**
@@ -136,9 +171,14 @@ public:
   virtual const std::string& accessLogPath() PURE;
 
   /**
-   * @return uint32_t the server admin HTTP port.
+   * @return const std::string& profiler output path.
    */
-  virtual uint32_t port() PURE;
+  virtual const std::string& profilePath() PURE;
+
+  /**
+   * @return Network::Address::InstanceConstSharedPtr the server address.
+   */
+  virtual Network::Address::InstanceConstSharedPtr address() PURE;
 };
 
 /**

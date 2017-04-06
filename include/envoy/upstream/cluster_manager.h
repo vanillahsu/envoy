@@ -3,6 +3,8 @@
 #include "envoy/http/async_client.h"
 #include "envoy/http/conn_pool.h"
 #include "envoy/json/json_object.h"
+#include "envoy/upstream/load_balancer.h"
+#include "envoy/upstream/thread_local_cluster.h"
 #include "envoy/upstream/upstream.h"
 
 namespace Upstream {
@@ -39,20 +41,29 @@ public:
   virtual ClusterInfoMap clusters() PURE;
 
   /**
-   * @return ClusterInfoPtr the cluster info with the given name or nullptr if it does not
+   * @return ClusterInfoConstSharedPtr the thread local cluster with the given name or nullptr if it
+   *does not
    * exist. This is thread safe.
+   *
+   * NOTE: The pointer returned by this function is ONLY safe to use in the context of the owning
+   * call (or if the caller knows that the cluster is fully static and will never be deleted). In
+   * the case of dynamic clusters, subsequent event loop iterations may invalidate this pointer.
+   * If information about the cluster needs to be kept, use the ThreadLocalCluster::info() method to
+   * obtain cluster information that is safe to store.
    */
-  virtual ClusterInfoPtr get(const std::string& cluster) PURE;
+  virtual ThreadLocalCluster* get(const std::string& cluster) PURE;
 
   /**
    * Allocate a load balanced HTTP connection pool for a cluster. This is *per-thread* so that
    * callers do not need to worry about per thread synchronization. The load balancing policy that
    * is used is the one defined on the cluster when it was created.
    *
-   * Can return nullptr if there is no host available in the cluster.
+   * Can return nullptr if there is no host available in the cluster or if the cluster does not
+   * exist.
    */
   virtual Http::ConnectionPool::Instance* httpConnPoolForCluster(const std::string& cluster,
-                                                                 ResourcePriority priority) PURE;
+                                                                 ResourcePriority priority,
+                                                                 LoadBalancerContext* context) PURE;
 
   /**
    * Allocate a load balanced TCP connection for a cluster. The created connection is already
@@ -95,6 +106,27 @@ struct SdsConfig {
 };
 
 /**
+ * Abstract interface for a CDS API provider.
+ */
+class CdsApi {
+public:
+  virtual ~CdsApi() {}
+
+  /**
+   * Start the first fetch of CDS data.
+   */
+  virtual void initialize() PURE;
+
+  /**
+   * Set a callback that will be called when the CDS API has done an initial load from the remote
+   * server. If the initial load fails, the callback will also be called.
+   */
+  virtual void setInitializedCb(std::function<void()> callback) PURE;
+};
+
+typedef std::unique_ptr<CdsApi> CdsApiPtr;
+
+/**
  * Factory for objects needed during cluster manager operation.
  */
 class ClusterManagerFactory {
@@ -105,7 +137,7 @@ public:
    * Allocate an HTTP connection pool.
    */
   virtual Http::ConnectionPool::InstancePtr allocateConnPool(Event::Dispatcher& dispatcher,
-                                                             ConstHostPtr host,
+                                                             HostConstSharedPtr host,
                                                              ResourcePriority priority) PURE;
 
   /**
@@ -113,7 +145,12 @@ public:
    */
   virtual ClusterPtr clusterFromJson(const Json::Object& cluster, ClusterManager& cm,
                                      const Optional<SdsConfig>& sds_config,
-                                     Outlier::EventLoggerPtr outlier_event_logger) PURE;
+                                     Outlier::EventLoggerSharedPtr outlier_event_logger) PURE;
+
+  /**
+   * Create a CDS API provider from configuration JSON.
+   */
+  virtual CdsApiPtr createCds(const Json::Object& config, ClusterManager& cm) PURE;
 };
 
 } // Upstream

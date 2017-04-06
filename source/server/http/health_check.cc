@@ -1,4 +1,4 @@
-#include "health_check.h"
+#include "server/http/health_check.h"
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
@@ -11,6 +11,7 @@
 #include "common/http/header_map_impl.h"
 #include "common/http/headers.h"
 #include "common/http/utility.h"
+#include "common/json/config_schemas.h"
 #include "common/json/json_loader.h"
 
 namespace Server {
@@ -28,6 +29,8 @@ HttpFilterFactoryCb HealthCheckFilterConfig::tryCreateFilterFactory(HttpFilterTy
     return nullptr;
   }
 
+  config.validateSchema(Json::Schema::HEALTH_CHECK_HTTP_FILTER_SCHEMA);
+
   bool pass_through_mode = config.getBoolean("pass_through_mode");
   int64_t cache_time_ms = config.getInteger("cache_time_ms", 0);
   std::string hc_endpoint = config.getString("endpoint");
@@ -36,7 +39,7 @@ HttpFilterFactoryCb HealthCheckFilterConfig::tryCreateFilterFactory(HttpFilterTy
     throw EnvoyException("cache_time_ms must not be set when path_through_mode is disabled");
   }
 
-  HealthCheckCacheManagerPtr cache_manager;
+  HealthCheckCacheManagerSharedPtr cache_manager;
   if (cache_time_ms > 0) {
     cache_manager.reset(
         new HealthCheckCacheManager(server.dispatcher(), std::chrono::milliseconds(cache_time_ms)));
@@ -44,7 +47,7 @@ HttpFilterFactoryCb HealthCheckFilterConfig::tryCreateFilterFactory(HttpFilterTy
 
   return [&server, pass_through_mode, cache_manager, hc_endpoint](
              Http::FilterChainFactoryCallbacks& callbacks) -> void {
-    callbacks.addStreamFilter(Http::StreamFilterPtr{
+    callbacks.addStreamFilter(Http::StreamFilterSharedPtr{
         new HealthCheckFilter(server, pass_through_mode, cache_manager, hc_endpoint)});
   };
 }

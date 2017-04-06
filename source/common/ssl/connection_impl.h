@@ -1,8 +1,7 @@
 #pragma once
 
-#include "context_impl.h"
-
 #include "common/network/connection_impl.h"
+#include "common/ssl/context_impl.h"
 
 namespace Ssl {
 
@@ -10,8 +9,10 @@ class ConnectionImpl : public Network::ConnectionImpl, public Connection {
 public:
   enum class InitialState { Client, Server };
 
-  ConnectionImpl(Event::DispatcherImpl& dispatcher, int fd, const std::string& remote_address,
-                 Context& ctx, InitialState state);
+  ConnectionImpl(Event::DispatcherImpl& dispatcher, int fd,
+                 Network::Address::InstanceConstSharedPtr remote_address,
+                 Network::Address::InstanceConstSharedPtr local_address, Context& ctx,
+                 InitialState state);
   ~ConnectionImpl();
 
   // Network::Connection
@@ -20,6 +21,7 @@ public:
 
   // Ssl::Connection
   std::string sha256PeerCertificateDigest() override;
+  std::string uriSanPeerCertificate() override;
 
 private:
   PostIoAction doHandshake();
@@ -38,7 +40,8 @@ private:
 
 class ClientConnectionImpl final : public ConnectionImpl, public Network::ClientConnection {
 public:
-  ClientConnectionImpl(Event::DispatcherImpl& dispatcher, Context& ctx, const std::string& url);
+  ClientConnectionImpl(Event::DispatcherImpl& dispatcher, Context& ctx,
+                       Network::Address::InstanceConstSharedPtr address);
 
   // Network::ClientConnection
   void connect() override;

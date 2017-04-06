@@ -1,6 +1,7 @@
-#include "ratelimit.h"
+#include "common/filter/ratelimit.h"
 
 #include "common/common/empty_string.h"
+#include "common/json/config_schemas.h"
 
 namespace RateLimit {
 namespace TcpFilter {
@@ -8,6 +9,8 @@ namespace TcpFilter {
 Config::Config(const Json::Object& config, Stats::Store& stats_store, Runtime::Loader& runtime)
     : domain_(config.getString("domain")),
       stats_(generateStats(config.getString("stat_prefix"), stats_store)), runtime_(runtime) {
+
+  config.validateSchema(Json::Schema::RATELIMIT_NETWORK_FILTER_SCHEMA);
 
   for (const Json::ObjectPtr& descriptor : config.getObjectArray("descriptors")) {
     Descriptor new_descriptor;
@@ -40,7 +43,7 @@ Network::FilterStatus Instance::onNewConnection() {
     config_->stats().active_.inc();
     config_->stats().total_.inc();
     calling_limit_ = true;
-    client_->limit(*this, config_->domain(), config_->descriptors(), EMPTY_STRING);
+    client_->limit(*this, config_->domain(), config_->descriptors(), Tracing::EMPTY_CONTEXT);
     calling_limit_ = false;
   }
 

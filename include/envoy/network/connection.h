@@ -3,6 +3,7 @@
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/pure.h"
 #include "envoy/event/deferred_deletable.h"
+#include "envoy/network/address.h"
 #include "envoy/network/filter.h"
 #include "envoy/ssl/connection.h"
 
@@ -111,9 +112,17 @@ public:
   virtual bool readEnabled() PURE;
 
   /**
-   * @return The address of the remote client
+   * @return The address of the remote client.
    */
-  virtual const std::string& remoteAddress() PURE;
+  virtual const Address::Instance& remoteAddress() PURE;
+
+  /**
+   * @return the local address of the connection. For client connections, this is the origin
+   * address. For server connections, this is the local destination address. For server connections
+   * it can be different from the proxy address if the downstream connection has been redirected or
+   * the proxy is operating in transparent mode.
+   */
+  virtual const Address::Instance& localAddress() PURE;
 
   /**
    * Set the buffer stats to update when the connection's read/write buffers change. Note that
@@ -137,6 +146,17 @@ public:
    * are installed.
    */
   virtual void write(Buffer::Instance& data) PURE;
+
+  /**
+   * Set a soft limit on the size of the read buffer prior to flushing to further stages in the
+   * processing pipeline.
+   */
+  virtual void setReadBufferLimit(uint32_t limit) PURE;
+
+  /**
+   * Get the value set with setReadBufferLimit.
+   */
+  virtual uint32_t readBufferLimit() const PURE;
 };
 
 typedef std::unique_ptr<Connection> ConnectionPtr;

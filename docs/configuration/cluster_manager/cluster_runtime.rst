@@ -29,26 +29,48 @@ Outlier detection
 -----------------
 
 See the outlier detection :ref:`architecture overview <arch_overview_outlier_detection>` for more
-information on outlier detection.
+information on outlier detection. The runtime parameters supported by outlier detection are the 
+same as the :ref:`static configuration parameters <config_cluster_manager_cluster_outlier_detection>`, namely
 
 outlier_detection.consecutive_5xx
-  The number of consecutive 5xx responses before a consecutive 5xx ejection occurs. Defaults to 5.
+  :ref:`consecutive_5XX
+  <config_cluster_manager_cluster_outlier_detection_consecutive_5xx>`
+  setting in outlier detection
 
 outlier_detection.interval_ms
-  The time interval between ejection analysis sweeps. This can result in both new ejections as well
-  as hosts being returned to service. Defaults to 10000ms or 10s.
+  :ref:`interval_ms
+  <config_cluster_manager_cluster_outlier_detection_interval_ms>`
+  setting in outlier detection
 
 outlier_detection.base_ejection_time_ms
-  The base time that a host is ejected for. The real time is equal to the base time multiplied by
-  the number of times the host has been ejected. Defaults to 30000ms or 30s.
+  :ref:`base_ejection_time_ms
+  <config_cluster_manager_cluster_outlier_detection_base_ejection_time_ms>`
+  setting in outlier detection
 
 outlier_detection.max_ejection_percent
-  The maximum % of an upstream cluster that can be ejected due to outlier detection. Defaults to
-  10%.
+  :ref:`max_ejection_percent
+  <config_cluster_manager_cluster_outlier_detection_max_ejection_percent>`
+  setting in outlier detection
 
-outlier_detection.enforcing
-  The % chance that a host will be actually ejected when an outlier status is detected. This setting
-  can be used to disable ejection or to ramp it up slowly. Defaults to 100.
+outlier_detection.enforcing_consecutive_5xx
+  :ref:`enforcing_consecutive_5xx
+  <config_cluster_manager_cluster_outlier_detection_enforcing_consecutive_5xx>`
+  setting in outlier detection
+
+outlier_detection.enforcing_success_rate
+  :ref:`enforcing_success_rate
+  <config_cluster_manager_cluster_outlier_detection_enforcing_success_rate>`
+  setting in outlier detection
+
+outlier_detection.success_rate_minimum_hosts
+  :ref:`success_rate_minimum_hosts
+  <config_cluster_manager_cluster_outlier_detection_success_rate_minimum_hosts>`
+  setting in outlier detection
+
+outlier_detection.success_rate_request_volume
+  :ref:`success_rate_request_volume
+  <config_cluster_manager_cluster_outlier_detection_success_rate_request_volume>`
+  setting in outlier detection
 
 Core
 ----
@@ -64,6 +86,15 @@ upstream.use_http2
 upstream.weight_enabled
   Binary switch to turn on or off weighted load balancing. If set to non 0, weighted load balancing
   is enabled. Defaults to enabled.
+
+.. _config_cluster_manager_cluster_runtime_ring_hash:
+
+Ring hash load balancing
+------------------------
+
+upstream.ring_hash.min_ring_size
+  The minimum size of the hash ring for the :ref:`ring hash load balancer
+  <arch_overview_load_balancing_types>`. The default is 1024.
 
 .. _config_cluster_manager_cluster_runtime_zone_routing:
 

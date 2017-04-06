@@ -1,4 +1,4 @@
-#include "admin.h"
+#include "server/http/admin.h"
 
 #include "envoy/filesystem/filesystem.h"
 #include "envoy/server/hot_restart.h"
@@ -100,6 +100,17 @@ bool AdminImpl::changeLogLevel(const Http::Utility::QueryParams& params) {
   return true;
 }
 
+void AdminImpl::addOutlierInfo(const std::string& cluster_name,
+                               const Upstream::Outlier::Detector* outlier_detector,
+                               Buffer::Instance& response) {
+  if (outlier_detector) {
+    response.add(fmt::format("{}::outlier::success_rate_average::{}", cluster_name,
+                             outlier_detector->successRateAverage()));
+    response.add(fmt::format("{}::outlier::success_rate_ejection_threshold::{}", cluster_name,
+                             outlier_detector->successRateEjectionThreshold()));
+  }
+}
+
 void AdminImpl::addCircuitSettings(const std::string& cluster_name, const std::string& priority_str,
                                    Upstream::ResourceManager& resource_manager,
                                    Buffer::Instance& response) {
@@ -115,6 +126,9 @@ void AdminImpl::addCircuitSettings(const std::string& cluster_name, const std::s
 
 Http::Code AdminImpl::handlerClusters(const std::string&, Buffer::Instance& response) {
   for (auto& cluster : server_.clusterManager().clusters()) {
+    addOutlierInfo(cluster.second.get().info()->name(), cluster.second.get().outlierDetector(),
+                   response);
+
     addCircuitSettings(
         cluster.second.get().info()->name(), "default",
         cluster.second.get().info()->resourceManager(Upstream::ResourcePriority::Default),
@@ -125,27 +139,30 @@ Http::Code AdminImpl::handlerClusters(const std::string&, Buffer::Instance& resp
 
     for (auto& host : cluster.second.get().hosts()) {
       std::map<std::string, uint64_t> all_stats;
-      for (Stats::Counter& counter : host->counters()) {
-        all_stats[counter.name()] = counter.value();
+      for (Stats::CounterSharedPtr counter : host->counters()) {
+        all_stats[counter->name()] = counter->value();
       }
 
-      for (Stats::Gauge& gauge : host->gauges()) {
-        all_stats[gauge.name()] = gauge.value();
+      for (Stats::GaugeSharedPtr gauge : host->gauges()) {
+        all_stats[gauge->name()] = gauge->value();
       }
 
       for (auto stat : all_stats) {
         response.add(fmt::format("{}::{}::{}::{}\n", cluster.second.get().info()->name(),
-                                 host->url(), stat.first, stat.second));
+                                 host->address()->asString(), stat.first, stat.second));
       }
 
       response.add(fmt::format("{}::{}::health_flags::{}\n", cluster.second.get().info()->name(),
-                               host->url(), Upstream::HostUtility::healthFlagsToString(*host)));
+                               host->address()->asString(),
+                               Upstream::HostUtility::healthFlagsToString(*host)));
       response.add(fmt::format("{}::{}::weight::{}\n", cluster.second.get().info()->name(),
-                               host->url(), host->weight()));
+                               host->address()->asString(), host->weight()));
       response.add(fmt::format("{}::{}::zone::{}\n", cluster.second.get().info()->name(),
-                               host->url(), host->zone()));
+                               host->address()->asString(), host->zone()));
       response.add(fmt::format("{}::{}::canary::{}\n", cluster.second.get().info()->name(),
-                               host->url(), host->canary()));
+                               host->address()->asString(), host->canary()));
+      response.add(fmt::format("{}::{}::success_rate::{}\n", cluster.second.get().info()->name(),
+                               host->address()->asString(), host->outlierDetector().successRate()));
     }
   }
 
@@ -162,7 +179,11 @@ Http::Code AdminImpl::handlerCpuProfiler(const std::string& url, Buffer::Instanc
 
   bool enable = query_params.begin()->second == "y";
   if (enable && !Profiler::Cpu::profilerEnabled()) {
-    Profiler::Cpu::startProfiler("/var/log/envoy/envoy.prof");
+    if (!Profiler::Cpu::startProfiler(profile_path_)) {
+      response.add("failure to start the profiler");
+      return Http::Code::InternalServerError;
+    }
+
   } else if (!enable && Profiler::Cpu::profilerEnabled()) {
     Profiler::Cpu::stopProfiler();
   }
@@ -214,8 +235,8 @@ Http::Code AdminImpl::handlerLogging(const std::string& url, Buffer::Instance& r
 }
 
 Http::Code AdminImpl::handlerResetCounters(const std::string&, Buffer::Instance& response) {
-  for (Stats::Counter& counter : server_.stats().counters()) {
-    counter.reset();
+  for (Stats::CounterSharedPtr counter : server_.stats().counters()) {
+    counter->reset();
   }
 
   response.add("OK\n");
@@ -236,12 +257,12 @@ Http::Code AdminImpl::handlerStats(const std::string&, Buffer::Instance& respons
   // We currently don't support timers locally (only via statsd) so just group all the counters
   // and gauges together, alpha sort them, and spit them out.
   std::map<std::string, uint64_t> all_stats;
-  for (Stats::Counter& counter : server_.stats().counters()) {
-    all_stats.emplace(counter.name(), counter.value());
+  for (Stats::CounterSharedPtr counter : server_.stats().counters()) {
+    all_stats.emplace(counter->name(), counter->value());
   }
 
-  for (Stats::Gauge& gauge : server_.stats().gauges()) {
-    all_stats.emplace(gauge.name(), gauge.value());
+  for (Stats::GaugeSharedPtr gauge : server_.stats().gauges()) {
+    all_stats.emplace(gauge->name(), gauge->value());
   }
 
   for (auto stat : all_stats) {
@@ -291,10 +312,16 @@ void AdminFilter::onComplete() {
   }
 }
 
-AdminImpl::AdminImpl(const std::string& access_log_path, uint32_t port, Server::Instance& server)
-    : server_(server), socket_(new Network::TcpListenSocket(port, true)),
+AdminImpl::NullRouteConfigProvider::NullRouteConfigProvider()
+    : config_(new Router::NullConfigImpl()) {}
+
+AdminImpl::AdminImpl(const std::string& access_log_path, const std::string& profile_path,
+                     Network::Address::InstanceConstSharedPtr address, Server::Instance& server)
+    : server_(server), profile_path_(profile_path),
+      socket_(new Network::TcpListenSocket(address, true)),
       stats_(Http::ConnectionManagerImpl::generateStats("http.admin.", server_.stats())),
-      route_config_(new Router::NullConfigImpl()),
+      tracing_stats_(Http::ConnectionManagerImpl::generateTracingStats("http.admin.tracing.",
+                                                                       server_.stats())),
       handlers_{
           {"/certs", "print certs on machine", MAKE_HANDLER(handlerCerts)},
           {"/clusters", "upstream cluster status", MAKE_HANDLER(handlerClusters)},
@@ -323,13 +350,14 @@ Http::ServerConnectionPtr AdminImpl::createCodec(Network::Connection& connection
   return Http::ServerConnectionPtr{new Http::Http1::ServerConnectionImpl(connection, callbacks)};
 }
 
-void AdminImpl::createFilterChain(Network::Connection& connection) {
-  connection.addReadFilter(Network::ReadFilterPtr{new Http::ConnectionManagerImpl(
+bool AdminImpl::createFilterChain(Network::Connection& connection) {
+  connection.addReadFilter(Network::ReadFilterSharedPtr{new Http::ConnectionManagerImpl(
       *this, server_.drainManager(), server_.random(), server_.httpTracer(), server_.runtime())});
+  return true;
 }
 
 void AdminImpl::createFilterChain(Http::FilterChainFactoryCallbacks& callbacks) {
-  callbacks.addStreamDecoderFilter(Http::StreamDecoderFilterPtr{new AdminFilter(*this)});
+  callbacks.addStreamDecoderFilter(Http::StreamDecoderFilterSharedPtr{new AdminFilter(*this)});
 }
 
 Http::Code AdminImpl::runCallback(const std::string& path, Buffer::Instance& response) {
@@ -361,6 +389,8 @@ Http::Code AdminImpl::runCallback(const std::string& path, Buffer::Instance& res
   return code;
 }
 
-const std::string& AdminImpl::localAddress() { return server_.localInfo().address(); }
+const Network::Address::Instance& AdminImpl::localAddress() {
+  return *server_.localInfo().address();
+}
 
 } // Server

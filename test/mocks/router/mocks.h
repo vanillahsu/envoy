@@ -46,20 +46,16 @@ public:
   ~MockRateLimitPolicyEntry();
 
   // Router::RateLimitPolicyEntry
-  MOCK_CONST_METHOD0(stage, int64_t());
-  MOCK_CONST_METHOD0(killSwitchKey, const std::string&());
-  MOCK_CONST_METHOD0(routeKey, const std::string&());
-
-  // Router::RateLimitAction
+  MOCK_CONST_METHOD0(stage, uint64_t());
+  MOCK_CONST_METHOD0(disableKey, const std::string&());
   MOCK_CONST_METHOD5(populateDescriptors,
                      void(const RouteEntry& route,
                           std::vector<::RateLimit::Descriptor>& descriptors,
                           const std::string& local_service_cluster, const Http::HeaderMap& headers,
                           const std::string& remote_address));
 
-  int64_t stage_{};
-  std::string kill_switch_key_;
-  std::string route_key_;
+  uint64_t stage_{};
+  std::string disable_key_;
 };
 
 class MockRateLimitPolicy : public RateLimitPolicy {
@@ -70,9 +66,8 @@ public:
   // Router::RateLimitPolicy
   MOCK_CONST_METHOD1(
       getApplicableRateLimit,
-      std::vector<std::reference_wrapper<const RateLimitPolicyEntry>>&(int64_t stage));
+      std::vector<std::reference_wrapper<const RateLimitPolicyEntry>>&(uint64_t stage));
 
-  std::string route_key_;
   std::vector<std::reference_wrapper<const Router::RateLimitPolicyEntry>> rate_limit_policy_entry_;
 };
 
@@ -124,6 +119,15 @@ public:
   testing::NiceMock<MockRateLimitPolicy> rate_limit_policy_;
 };
 
+class MockHashPolicy : public HashPolicy {
+public:
+  MockHashPolicy();
+  ~MockHashPolicy();
+
+  // Router::HashPolicy
+  MOCK_CONST_METHOD1(generateHash, Optional<uint64_t>(const Http::HeaderMap& headers));
+};
+
 class MockRouteEntry : public RouteEntry {
 public:
   MockRouteEntry();
@@ -132,6 +136,7 @@ public:
   // Router::Config
   MOCK_CONST_METHOD0(clusterName, const std::string&());
   MOCK_CONST_METHOD1(finalizeRequestHeaders, void(Http::HeaderMap& headers));
+  MOCK_CONST_METHOD0(hashPolicy, const HashPolicy*());
   MOCK_CONST_METHOD0(priority, Upstream::ResourcePriority());
   MOCK_CONST_METHOD0(rateLimitPolicy, const RateLimitPolicy&());
   MOCK_CONST_METHOD0(retryPolicy, const RetryPolicy&());
@@ -140,31 +145,17 @@ public:
   MOCK_CONST_METHOD1(virtualCluster, const VirtualCluster*(const Http::HeaderMap& headers));
   MOCK_CONST_METHOD0(virtualHostName, const std::string&());
   MOCK_CONST_METHOD0(virtualHost, const VirtualHost&());
+  MOCK_CONST_METHOD0(autoHostRewrite, bool());
+  MOCK_CONST_METHOD0(opaqueConfig, const std::multimap<std::string, std::string>&());
 
   std::string cluster_name_{"fake_cluster"};
+  std::multimap<std::string, std::string> opaque_config_;
   TestVirtualCluster virtual_cluster_;
   TestRetryPolicy retry_policy_;
   testing::NiceMock<MockRateLimitPolicy> rate_limit_policy_;
   TestShadowPolicy shadow_policy_;
   testing::NiceMock<MockVirtualHost> virtual_host_;
-};
-
-class MockConfig : public Config {
-public:
-  MockConfig();
-  ~MockConfig();
-
-  // Router::Config
-  MOCK_CONST_METHOD2(route, const Route*(const Http::HeaderMap&, uint64_t random_value));
-  MOCK_CONST_METHOD0(internalOnlyHeaders, const std::list<Http::LowerCaseString>&());
-  MOCK_CONST_METHOD0(responseHeadersToAdd,
-                     const std::list<std::pair<Http::LowerCaseString, std::string>>&());
-  MOCK_CONST_METHOD0(responseHeadersToRemove, const std::list<Http::LowerCaseString>&());
-  MOCK_CONST_METHOD0(usesRuntime, bool());
-
-  std::list<Http::LowerCaseString> internal_only_headers_;
-  std::list<std::pair<Http::LowerCaseString, std::string>> response_headers_to_add_;
-  std::list<Http::LowerCaseString> response_headers_to_remove_;
+  MockHashPolicy hash_policy_;
 };
 
 class MockRoute : public Route {
@@ -179,15 +170,23 @@ public:
   testing::NiceMock<MockRouteEntry> route_entry_;
 };
 
-class MockStableRouteTable : public StableRouteTable {
+class MockConfig : public Config {
 public:
-  MockStableRouteTable();
-  ~MockStableRouteTable();
+  MockConfig();
+  ~MockConfig();
 
-  // Router::StableRouteTable
-  MOCK_CONST_METHOD1(route, const Route*(const Http::HeaderMap&));
+  // Router::Config
+  MOCK_CONST_METHOD2(route, RouteConstSharedPtr(const Http::HeaderMap&, uint64_t random_value));
+  MOCK_CONST_METHOD0(internalOnlyHeaders, const std::list<Http::LowerCaseString>&());
+  MOCK_CONST_METHOD0(responseHeadersToAdd,
+                     const std::list<std::pair<Http::LowerCaseString, std::string>>&());
+  MOCK_CONST_METHOD0(responseHeadersToRemove, const std::list<Http::LowerCaseString>&());
+  MOCK_CONST_METHOD0(usesRuntime, bool());
 
-  testing::NiceMock<MockRoute> route_;
+  std::shared_ptr<MockRoute> route_;
+  std::list<Http::LowerCaseString> internal_only_headers_;
+  std::list<std::pair<Http::LowerCaseString, std::string>> response_headers_to_add_;
+  std::list<Http::LowerCaseString> response_headers_to_remove_;
 };
 
 } // Router

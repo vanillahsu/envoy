@@ -5,9 +5,11 @@
 #include "common/common/assert.h"
 #include "common/common/logger.h"
 #include "common/common/thread.h"
-
+#include "common/stats/stats_impl.h"
 #include "server/server.h"
 #include "server/test_hooks.h"
+
+#include "test/test_common/utility.h"
 
 namespace Server {
 
@@ -47,6 +49,56 @@ public:
 
 } // Server
 
+namespace Stats {
+
+/**
+ * This is a variant of the isolated store that has locking across all operations so that it can
+ * be used during the integration tests.
+ */
+class TestIsolatedStoreImpl : public StoreRoot {
+public:
+  // Stats::Scope
+  Counter& counter(const std::string& name) override {
+    std::unique_lock<std::mutex> lock(lock_);
+    return store_.counter(name);
+  }
+  void deliverHistogramToSinks(const std::string&, uint64_t) override {}
+  void deliverTimingToSinks(const std::string&, std::chrono::milliseconds) override {}
+  Gauge& gauge(const std::string& name) override {
+    std::unique_lock<std::mutex> lock(lock_);
+    return store_.gauge(name);
+  }
+  Timer& timer(const std::string& name) override {
+    std::unique_lock<std::mutex> lock(lock_);
+    return store_.timer(name);
+  }
+
+  // Stats::Store
+  std::list<CounterSharedPtr> counters() const override {
+    std::unique_lock<std::mutex> lock(lock_);
+    return store_.counters();
+  }
+  std::list<GaugeSharedPtr> gauges() const override {
+    std::unique_lock<std::mutex> lock(lock_);
+    return store_.gauges();
+  }
+  ScopePtr createScope(const std::string& name) override {
+    std::unique_lock<std::mutex> lock(lock_);
+    return store_.createScope(name);
+  }
+
+  // Stats::StoreRoot
+  void addSink(Sink&) override {}
+  void initializeThreading(Event::Dispatcher&, ThreadLocal::Instance&) override {}
+  void shutdownThreading() override {}
+
+private:
+  mutable std::mutex lock_;
+  IsolatedStoreImpl store_;
+};
+
+} // Stats
+
 class IntegrationTestServer;
 typedef std::unique_ptr<IntegrationTestServer> IntegrationTestServerPtr;
 
@@ -61,8 +113,12 @@ public:
   ~IntegrationTestServer();
 
   Server::TestDrainManager& drainManager() { return *drain_manager_; }
-  Server::InstanceImpl& server() { return *server_; }
+  Server::InstanceImpl& server() {
+    RELEASE_ASSERT(server_ != nullptr);
+    return *server_;
+  }
   void start();
+  Stats::Store& store() { return stats_store_; }
 
   // TestHooks
   void onServerInitialized() override { server_initialized_.setReady(); }
@@ -72,8 +128,6 @@ public:
     drain_manager_ = new Server::TestDrainManager();
     return Server::DrainManagerPtr{drain_manager_};
   }
-
-  // Server::ComponentFactory
   Runtime::LoaderPtr createRuntime(Server::Instance& server,
                                    Server::Configuration::Initial& config) override {
     return Server::InstanceUtil::createRuntime(server, config);
@@ -90,7 +144,9 @@ private:
 
   const std::string config_path_;
   Thread::ThreadPtr thread_;
-  Thread::ConditionalInitializer server_initialized_;
+  ConditionalInitializer server_initialized_;
+  ConditionalInitializer server_set_;
   std::unique_ptr<Server::InstanceImpl> server_;
   Server::TestDrainManager* drain_manager_{};
+  Stats::TestIsolatedStoreImpl stats_store_;
 };

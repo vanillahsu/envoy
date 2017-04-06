@@ -57,7 +57,7 @@ If you have not cloned the envoy repo, clone it with ``git clone git@github.com:
 or ``git clone https://github.com/lyft/envoy.git``::
 
     $ pwd
-    envoy/example
+    envoy/examples/front-proxy
     $ docker-compose up --build -d
     $ docker-compose ps
             Name                       Command               State      Ports
@@ -240,7 +240,7 @@ gRPC bridge
 Envoy gRPC
 ~~~~~~~~~~
 
-The gRPC bridge sandbox is an example usage of Envoy's 
+The gRPC bridge sandbox is an example usage of Envoy's
 :ref:`gRPC bridge filter <config_http_filters_grpc_bridge>`.
 Included in the sandbox is a gRPC in memory Key/Value store with a Python HTTP
 client. The Python client makes HTTP/1 requests through the Envoy sidecar
@@ -250,34 +250,39 @@ buffered and sent back to the client as a HTTP/1 header payload.
 Another Envoy feature demonstrated in this example is Envoy's ability to do authority
 base routing via its route configuration.
 
+Building the Go service
+~~~~~~~~~~~~~~~~~~~~~~~
+
+To build the Go gRPC service run::
+
+  $ pwd
+  ~/src/envoy/examples/grpc-bridge
+  $ script/bootstrap
+  $ script/build
+
 Docker compose
 ~~~~~~~~~~~~~~
 
 To run the docker compose file, and set up both the Python and the gRPC containers
 run::
 
-  docker-compose up --build
+  $ pwd
+  ~/src/envoy/examples/grpc-bridge
+  $ docker-compose up --build
 
 Sending requests to the Key/Value store
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 To use the python service and sent gRPC requests::
-
+  $ pwd
+  ~/src/envoy/examples/grpc-bridge
   # set a key
-  docker-compose exec python /client/client.py set foo bar
-  => setf foo to bar
+  $ docker-compose exec python /client/client.py set foo bar
+  setf foo to bar
 
   # get a key
-  docker-compose exec python /client/client.py get foo
-  => bar
-  
-Building the Go service
-~~~~~~~~~~~~~~~~~~~~~~~
-
-To build the Go gRPC service run::
-
-  script/bootstrap
-  script/build
+  $ docker-compose exec python /client/client.py get foo
+  bar
 
 Locally building a docker image with an envoy binary
 ----------------------------------------------------
@@ -303,7 +308,7 @@ of the software used to build it.::
 
   $ pwd
   src/envoy/
-  $ docker build -f examples/Dockerfile-envoy-image -t envoy .
+  $ docker build -f ci/Dockerfile-envoy-image -t envoy .
 
 Now you can use this ``envoy`` image to build the any of the sandboxes if you change
 the ``FROM`` line in any dockerfile.

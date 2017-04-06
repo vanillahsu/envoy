@@ -1,33 +1,63 @@
-#include "configuration_impl.h"
-#include "server.h"
-#include "test_hooks.h"
-#include "worker.h"
+#include "server/server.h"
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/signal.h"
 #include "envoy/event/timer.h"
 #include "envoy/network/dns.h"
+#include "envoy/network/listener.h"
 #include "envoy/server/options.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/api/api_impl.h"
 #include "common/common/utility.h"
 #include "common/common/version.h"
+#include "common/json/config_schemas.h"
 #include "common/memory/stats.h"
+#include "common/network/utility.h"
 #include "common/runtime/runtime_impl.h"
-#include "common/stats/stats_impl.h"
 #include "common/stats/statsd.h"
+
+#include "server/configuration_impl.h"
+#include "server/guarddog_impl.h"
+#include "server/test_hooks.h"
+#include "server/worker.h"
 
 namespace Server {
 
+void InitManagerImpl::initialize(std::function<void()> callback) {
+  ASSERT(state_ == State::NotInitialized);
+  if (targets_.empty()) {
+    callback();
+    state_ = State::Initialized;
+  } else {
+    callback_ = callback;
+    state_ = State::Initializing;
+    for (auto target : targets_) {
+      target->initialize([this, target]() -> void {
+        ASSERT(std::find(targets_.begin(), targets_.end(), target) != targets_.end());
+        targets_.remove(target);
+        if (targets_.empty()) {
+          state_ = State::Initialized;
+          callback_();
+        }
+      });
+    }
+  }
+}
+
+void InitManagerImpl::registerTarget(Init::Target& target) {
+  ASSERT(state_ == State::NotInitialized);
+  targets_.push_back(&target);
+}
+
 InstanceImpl::InstanceImpl(Options& options, TestHooks& hooks, HotRestart& restarter,
-                           Stats::Store& store, Thread::BasicLockable& access_log_lock,
+                           Stats::StoreRoot& store, Thread::BasicLockable& access_log_lock,
                            ComponentFactory& component_factory,
                            const LocalInfo::LocalInfo& local_info)
     : options_(options), restarter_(restarter), start_time_(time(nullptr)),
       original_start_time_(start_time_), stats_store_(store),
       server_stats_{ALL_SERVER_STATS(POOL_GAUGE_PREFIX(stats_store_, "server."))},
-      handler_(stats_store_, log(), Api::ApiPtr{new Api::Impl(options.fileFlushIntervalMsec())}),
+      handler_(log(), Api::ApiPtr{new Api::Impl(options.fileFlushIntervalMsec())}),
       dns_resolver_(handler_.dispatcher().createDnsResolver()), local_info_(local_info),
       access_log_manager_(handler_.api(), handler_.dispatcher(), access_log_lock, store) {
 
@@ -39,7 +69,7 @@ InstanceImpl::InstanceImpl(Options& options, TestHooks& hooks, HotRestart& resta
   }
   server_stats_.version_.set(version_int);
 
-  if (local_info_.address().empty()) {
+  if (!local_info_.address()) {
     throw EnvoyException("could not resolve local address");
   }
 
@@ -50,6 +80,7 @@ InstanceImpl::InstanceImpl(Options& options, TestHooks& hooks, HotRestart& resta
     initialize(options, hooks, component_factory);
   } catch (const EnvoyException& e) {
     log().critical("error initializing configuration '{}': {}", options.configPath(), e.what());
+    thread_local_.shutdownThread();
     exit(1);
   }
 }
@@ -86,19 +117,19 @@ void InstanceImpl::flushStats() {
   server_stats_.days_until_first_cert_expiring_.set(
       sslContextManager().daysUntilFirstCertExpires());
 
-  for (Stats::Counter& counter : stats_store_.counters()) {
-    uint64_t delta = counter.latch();
-    if (counter.used()) {
+  for (Stats::CounterSharedPtr counter : stats_store_.counters()) {
+    uint64_t delta = counter->latch();
+    if (counter->used()) {
       for (const auto& sink : stat_sinks_) {
-        sink->flushCounter(counter.name(), delta);
+        sink->flushCounter(counter->name(), delta);
       }
     }
   }
 
-  for (Stats::Gauge& gauge : stats_store_.gauges()) {
-    if (gauge.used()) {
+  for (Stats::GaugeSharedPtr gauge : stats_store_.gauges()) {
+    if (gauge->used()) {
       for (const auto& sink : stat_sinks_) {
-        sink->flushGauge(gauge.name(), gauge.value());
+        sink->flushGauge(gauge->name(), gauge->value());
       }
     }
   }
@@ -106,14 +137,23 @@ void InstanceImpl::flushStats() {
   stat_flush_timer_->enableTimer(config_->statsFlushInterval());
 }
 
-int InstanceImpl::getListenSocketFd(uint32_t port) {
+int InstanceImpl::getListenSocketFd(const std::string& address) {
+  Network::Address::InstanceConstSharedPtr addr = Network::Utility::resolveUrl(address);
   for (const auto& entry : socket_map_) {
-    if (entry.second->port() == port) {
+    if (entry.second->localAddress()->asString() == addr->asString()) {
       return entry.second->fd();
     }
   }
 
   return -1;
+}
+
+Network::ListenSocket* InstanceImpl::getListenSocketByIndex(uint32_t index) {
+  if (index < config_->listeners().size()) {
+    auto it = std::next(config_->listeners().begin(), index);
+    return socket_map_[it->get()].get();
+  }
+  return nullptr;
 }
 
 void InstanceImpl::getParentStats(HotRestart::GetParentStatsInfo& info) {
@@ -130,28 +170,35 @@ void InstanceImpl::initialize(Options& options, TestHooks& hooks,
 
   // Handle configuration that needs to take place prior to the main configuration load.
   Json::ObjectPtr config_json = Json::Factory::LoadFromFile(options.configPath());
+  config_json->validateSchema(Json::Schema::TOP_LEVEL_CONFIG_SCHEMA);
   Configuration::InitialImpl initial_config(*config_json);
-  log().info("admin port: {}", initial_config.admin().port());
+  log().info("admin address: {}", initial_config.admin().address()->asString());
 
   HotRestart::ShutdownParentAdminInfo info;
   info.original_start_time_ = original_start_time_;
   restarter_.shutdownParentAdmin(info);
   drain_manager_->startParentShutdownSequence();
   original_start_time_ = info.original_start_time_;
-  admin_.reset(
-      new AdminImpl(initial_config.admin().accessLogPath(), initial_config.admin().port(), *this));
-  handler_.addListener(*admin_, admin_->socket(), true, false, false);
+  admin_.reset(new AdminImpl(initial_config.admin().accessLogPath(),
+                             initial_config.admin().profilePath(), initial_config.admin().address(),
+                             *this));
+  admin_scope_ = stats_store_.createScope("listener.admin.");
+  handler_.addListener(*admin_, admin_->mutable_socket(), *admin_scope_,
+                       Network::ListenerOptions::listenerOptionsWithBindToPort());
 
   loadServerFlags(initial_config.flagsPath());
 
   // Workers get created first so they register for thread local updates.
   for (uint32_t i = 0; i < std::max(1U, options.concurrency()); i++) {
-    workers_.emplace_back(new Worker(stats_store_, thread_local_, options.fileFlushIntervalMsec()));
+    workers_.emplace_back(new Worker(thread_local_, options.fileFlushIntervalMsec()));
   }
 
   // The main thread is also registered for thread local updates so that code that does not care
   // whether it runs on the main thread or on workers can still use TLS.
   thread_local_.registerThread(handler_.dispatcher(), true);
+
+  // We can now initialize stats for threading.
+  stats_store_.initializeThreading(handler_.dispatcher(), thread_local_);
 
   // Runtime gets initialized before the main configuration since during main configuration
   // load things may grab a reference to the loader for later use.
@@ -172,13 +219,16 @@ void InstanceImpl::initialize(Options& options, TestHooks& hooks,
     // used for testing.
 
     // First we try to get the socket from our parent if applicable.
-    int fd = restarter_.duplicateParentListenSocket(listener->port());
+
+    ASSERT(listener->address()->type() == Network::Address::Type::Ip);
+    std::string addr = fmt::format("tcp://{}", listener->address()->asString());
+    int fd = restarter_.duplicateParentListenSocket(addr);
     if (fd != -1) {
-      log().info("obtained socket for port {} from parent", listener->port());
-      socket_map_[listener.get()].reset(new Network::TcpListenSocket(fd, listener->port()));
+      log().info("obtained socket for address {} from parent", addr);
+      socket_map_[listener.get()].reset(new Network::TcpListenSocket(fd, listener->address()));
     } else {
       socket_map_[listener.get()].reset(
-          new Network::TcpListenSocket(listener->port(), listener->bindToPort()));
+          new Network::TcpListenSocket(listener->address(), listener->bindToPort()));
     }
   }
 
@@ -194,33 +244,8 @@ void InstanceImpl::initialize(Options& options, TestHooks& hooks,
     access_log_manager_.reopen();
   });
 
-  sig_hup_ = handler_.dispatcher().listenForSignal(SIGHUP, [this]() -> void {
+  sig_hup_ = handler_.dispatcher().listenForSignal(SIGHUP, []() -> void {
     log().warn("caught and eating SIGHUP. See documentation for how to hot restart.");
-  });
-
-  // Register for cluster manager init notification. We don't start serving worker traffic until
-  // upstream clusters are initialized which may involve running the event loop. Note however that
-  // if there are only static clusters this will fire immediately.
-  clusterManager().setInitializedCb([this, &hooks]() -> void {
-    log().warn("all clusters initialized. starting workers");
-    for (const WorkerPtr& worker : workers_) {
-      try {
-        worker->initializeConfiguration(*config_, socket_map_);
-      } catch (const Network::CreateListenerException& e) {
-        // It is possible that we fail to start listening on a port, even though we were able to
-        // bind to it above. This happens when there is a race between two applications to listen
-        // on the same port. In general if we can't initialize the worker configuration just print
-        // the error and exit cleanly without crashing.
-        log().critical("shutting down due to error initializing worker configuration: {}",
-                       e.what());
-        shutdown();
-      }
-    }
-
-    // At this point we are ready to take traffic and all listening ports are up. Notify our parent
-    // if applicable that they can stop listening and drain.
-    restarter_.drainParentListeners();
-    hooks.onServerInitialized();
   });
 
   initializeStatSinks();
@@ -229,6 +254,40 @@ void InstanceImpl::initialize(Options& options, TestHooks& hooks,
   // Just setup the timer.
   stat_flush_timer_ = handler_.dispatcher().createTimer([this]() -> void { flushStats(); });
   stat_flush_timer_->enableTimer(config_->statsFlushInterval());
+
+  // GuardDog (deadlock detection) object and thread setup before workers are
+  // started and before our own run() loop runs.
+  guard_dog_.reset(
+      new Server::GuardDogImpl(*admin_scope_, *config_, ProdSystemTimeSource::instance_));
+
+  // Register for cluster manager init notification. We don't start serving worker traffic until
+  // upstream clusters are initialized which may involve running the event loop. Note however that
+  // this can fire immediately if all clusters have already initialized.
+  clusterManager().setInitializedCb([this, &hooks]() -> void {
+    log().warn("all clusters initialized. initializing init manager");
+    init_manager_.initialize([this, &hooks]() -> void { startWorkers(hooks); });
+  });
+}
+
+void InstanceImpl::startWorkers(TestHooks& hooks) {
+  log().warn("all dependencies initialized. starting workers");
+  for (const WorkerPtr& worker : workers_) {
+    try {
+      worker->initializeConfiguration(*config_, socket_map_, *guard_dog_);
+    } catch (const Network::CreateListenerException& e) {
+      // It is possible that we fail to start listening on a port, even though we were able to
+      // bind to it above. This happens when there is a race between two applications to listen
+      // on the same port. In general if we can't initialize the worker configuration just print
+      // the error and exit cleanly without crashing.
+      log().critical("shutting down due to error initializing worker configuration: {}", e.what());
+      shutdown();
+    }
+  }
+
+  // At this point we are ready to take traffic and all listening ports are up. Notify our parent
+  // if applicable that they can stop listening and drain.
+  restarter_.drainParentListeners();
+  hooks.onServerInitialized();
 }
 
 Runtime::LoaderPtr InstanceUtil::createRuntime(Instance& server,
@@ -291,9 +350,15 @@ uint64_t InstanceImpl::numConnections() {
 void InstanceImpl::run() {
   // Run the main dispatch loop waiting to exit.
   log().warn("starting main dispatch loop");
-  handler_.startWatchdog();
+  auto watchdog = guard_dog_->createWatchDog(Thread::Thread::currentThreadId());
+  watchdog->startWatchdog(handler_.dispatcher());
   handler_.dispatcher().run(Event::Dispatcher::RunType::Block);
   log().warn("main dispatch loop exited");
+  guard_dog_->stopWatching(watchdog);
+  watchdog.reset();
+
+  // Before the workers start exiting we should disable stat threading.
+  stats_store_.shutdownThreading();
 
   // Shutdown all the listeners now that the main dispatch loop is done.
   for (const WorkerPtr& worker : workers_) {
@@ -314,8 +379,6 @@ void InstanceImpl::run() {
 
 Runtime::Loader& InstanceImpl::runtime() { return *runtime_loader_; }
 
-InstanceImpl::~InstanceImpl() {}
-
 void InstanceImpl::shutdown() {
   log().warn("shutdown invoked. sending SIGTERM to self");
   kill(getpid(), SIGTERM);
@@ -325,7 +388,7 @@ void InstanceImpl::shutdownAdmin() {
   log().warn("shutting down admin due to child startup");
   stat_flush_timer_.reset();
   handler_.closeListeners();
-  admin_->socket().close();
+  admin_->mutable_socket().close();
 
   log().warn("terminating parent process");
   restarter_.terminateParent();

@@ -4,7 +4,6 @@
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "common/json/json_loader.h"
 #include "common/router/config_impl.h"
 
 namespace Http {
@@ -40,6 +39,7 @@ public:
   uint64_t delayPercent() { return fixed_delay_percent_; }
   uint64_t delayDuration() { return fixed_duration_ms_; }
   uint64_t abortCode() { return http_status_; }
+  const std::string& upstreamCluster() { return upstream_cluster_; }
   Runtime::Loader& runtime() { return runtime_; }
   FaultFilterStats& stats() { return stats_; }
 
@@ -50,19 +50,20 @@ private:
   uint64_t http_status_{};         // HTTP or gRPC return codes
   uint64_t fixed_delay_percent_{}; // 0-100
   uint64_t fixed_duration_ms_{};   // in milliseconds
+  std::string upstream_cluster_;   // restrict faults to specific upstream cluster
   std::vector<Router::ConfigUtility::HeaderData> fault_filter_headers_;
   Runtime::Loader& runtime_;
   FaultFilterStats stats_;
 };
 
-typedef std::shared_ptr<FaultFilterConfig> FaultFilterConfigPtr;
+typedef std::shared_ptr<FaultFilterConfig> FaultFilterConfigSharedPtr;
 
 /**
  * A filter that is capable of faulting an entire request before dispatching it upstream.
  */
 class FaultFilter : public StreamDecoderFilter {
 public:
-  FaultFilter(FaultFilterConfigPtr config);
+  FaultFilter(FaultFilterConfigSharedPtr config);
   ~FaultFilter();
 
   FilterHeadersStatus decodeHeaders(HeaderMap& headers, bool end_stream) override;
@@ -75,8 +76,9 @@ private:
   void resetTimerState();
   void postDelayInjection();
   void abortWithHTTPStatus();
+  bool matchesTargetCluster();
 
-  FaultFilterConfigPtr config_;
+  FaultFilterConfigSharedPtr config_;
   StreamDecoderFilterCallbacks* callbacks_{};
   Event::TimerPtr delay_timer_;
 };

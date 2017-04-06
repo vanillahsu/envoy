@@ -1,4 +1,4 @@
-#include "codec_impl.h"
+#include "common/http/http1/codec_impl.h"
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/http/header_map.h"
@@ -161,7 +161,7 @@ void ConnectionImpl::reserveBuffer(uint64_t size) {
 
   // TODO PERF: It would be better to allow a split reservation. That will make fill code more
   //            complicated.
-  output_buffer_.reserve(std::max(4096UL, size), &reserved_iovec_, 1);
+  output_buffer_.reserve(std::max<uint64_t>(4096, size), &reserved_iovec_, 1);
   reserved_current_ = static_cast<char*>(reserved_iovec_.mem_);
 }
 
@@ -393,9 +393,8 @@ int ServerConnectionImpl::onHeadersComplete(HeaderMapImplPtr&& headers) {
     const char* method_string = http_method_str(static_cast<http_method>(parser_.method));
     headers->insertMethod().value(method_string, strlen(method_string));
 
-    // Deal with expect: 100-continue here since a) only HTTP/1.1 has this, b) higher layers are
-    // never going to do anything other than say to continue since we can response before request
-    // complete if necessary.
+    // Deal with expect: 100-continue here since higher layers are never going to do anything other
+    // than say to continue so that we can respond before request complete if necessary.
     if (headers->Expect() &&
         0 == StringUtil::caseInsensitiveCompare(headers->Expect()->value().c_str(),
                                                 Headers::get().ExpectValues._100Continue.c_str())) {

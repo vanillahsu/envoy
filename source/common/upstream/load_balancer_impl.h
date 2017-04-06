@@ -7,6 +7,19 @@
 namespace Upstream {
 
 /**
+ * Utilities common to all load balancers.
+ */
+class LoadBalancerUtility {
+public:
+  /**
+   * For the given host_set @return if we should be in a panic mode or not. For example, if the
+   * majority of hosts are unhealthy we'll be likely in a panic mode. In this case we'll route
+   * requests to hosts regardless of whether they are healthy or not.
+   */
+  static bool isGlobalPanic(const HostSet& host_set, ClusterStats& stats, Runtime::Loader& runtime);
+};
+
+/**
  * Base class for all LB implementations.
  */
 class LoadBalancerBase {
@@ -17,7 +30,7 @@ protected:
   /**
    * Pick the host list to use (healthy or all depending on how many in the set are not healthy).
    */
-  const std::vector<HostPtr>& hostsToUse();
+  const std::vector<HostSharedPtr>& hostsToUse();
 
   ClusterStats& stats_;
   Runtime::Loader& runtime_;
@@ -33,23 +46,16 @@ private:
   bool earlyExitNonZoneRouting();
 
   /**
-   * For the given host_set it @return if we should be in a panic mode or not.
-   * For example, if majority of hosts are unhealthy we'll be likely in a panic mode.
-   * In this case we'll route requests to hosts no matter if they are healthy or not.
-   */
-  bool isGlobalPanic(const HostSet& host_set);
-
-  /**
    * Try to select upstream hosts from the same zone.
    */
-  const std::vector<HostPtr>& tryChooseLocalZoneHosts();
+  const std::vector<HostSharedPtr>& tryChooseLocalZoneHosts();
 
   /**
    * @return (number of hosts in a given zone)/(total number of hosts) in ret param.
    * The result is stored as integer number and scaled by 10000 multiplier for better precision.
    * Caller is responsible for allocation/de-allocation of ret.
    */
-  void calculateZonePercentage(const std::vector<std::vector<HostPtr>>& hosts_per_zone,
+  void calculateZonePercentage(const std::vector<std::vector<HostSharedPtr>>& hosts_per_zone,
                                uint64_t* ret);
 
   /**
@@ -76,7 +82,7 @@ public:
       : LoadBalancerBase(host_set, local_host_set_, stats, runtime, random) {}
 
   // Upstream::LoadBalancer
-  ConstHostPtr chooseHost() override;
+  HostConstSharedPtr chooseHost(const LoadBalancerContext* context) override;
 
 private:
   size_t rr_index_{};
@@ -102,10 +108,10 @@ public:
                            Runtime::RandomGenerator& random);
 
   // Upstream::LoadBalancer
-  ConstHostPtr chooseHost() override;
+  HostConstSharedPtr chooseHost(const LoadBalancerContext* context) override;
 
 private:
-  HostPtr last_host_;
+  HostSharedPtr last_host_;
   uint32_t hits_left_{};
 };
 
@@ -119,7 +125,7 @@ public:
       : LoadBalancerBase(host_set, local_host_set, stats, runtime, random) {}
 
   // Upstream::LoadBalancer
-  ConstHostPtr chooseHost() override;
+  HostConstSharedPtr chooseHost(const LoadBalancerContext* context) override;
 };
 
 } // Upstream

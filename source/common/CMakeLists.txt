@@ -45,6 +45,7 @@ add_library(
   filter/ratelimit.cc
   filter/tcp_proxy.cc
   generated/ratelimit.pb.cc
+  grpc/codec.cc
   grpc/common.cc
   grpc/http1_bridge_filter.cc
   grpc/rpc_channel_impl.cc
@@ -65,14 +66,18 @@ add_library(
   http/filter/buffer_filter.cc
   http/filter/fault_filter.cc
   http/filter/ratelimit.cc
+  http/rest_api_fetcher.cc
   http/user_agent.cc
   http/utility.cc
+  json/config_schemas.cc
   json/json_loader.cc
   memory/stats.cc
   mongo/bson_impl.cc
   mongo/codec_impl.cc
   mongo/proxy.cc
   mongo/utility.cc
+  network/address_impl.cc
+  network/cidr_range.cc
   network/connection_impl.cc
   network/dns_impl.cc
   network/filter_manager_impl.cc
@@ -83,9 +88,12 @@ add_library(
   profiler/profiler.cc
   ratelimit/ratelimit_impl.cc
   redis/codec_impl.cc
+  redis/command_splitter_impl.cc
   redis/conn_pool_impl.cc
   redis/proxy_filter.cc
   router/config_impl.cc
+  router/config_utility.cc
+  router/rds_impl.cc
   router/retry_state_impl.cc
   router/router.cc
   router/router_ratelimit.cc
@@ -98,16 +106,18 @@ add_library(
   ssl/context_manager_impl.cc
   ssl/openssl.cc
   stats/stats_impl.cc
-  stats/stats_scope_impl.cc
   stats/statsd.cc
+  stats/thread_local_store.cc
   thread_local/thread_local_impl.cc
   tracing/http_tracer_impl.cc
+  upstream/cds_api_impl.cc
   upstream/cluster_manager_impl.cc
   upstream/health_checker_impl.cc
   upstream/host_utility.cc
   upstream/load_balancer_impl.cc
   upstream/logical_dns_cluster.cc
   upstream/outlier_detection_impl.cc
+  upstream/ring_hash_lb.cc
   upstream/sds.cc
   upstream/upstream_impl.cc
   ${gen_git_sha_target})
@@ -119,6 +129,7 @@ if (NOT ENVOY_SANITIZE)
   include_directories(${ENVOY_GPERFTOOLS_INCLUDE_DIR})
 endif()
 
+include_directories(${ENVOY_CARES_INCLUDE_DIR})
 include_directories(${ENVOY_LIBEVENT_INCLUDE_DIR})
 include_directories(${ENVOY_NGHTTP2_INCLUDE_DIR})
 include_directories(SYSTEM ${ENVOY_OPENSSL_INCLUDE_DIR})

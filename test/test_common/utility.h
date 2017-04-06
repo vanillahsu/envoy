@@ -1,6 +1,17 @@
 #pragma once
 
+#include "envoy/buffer/buffer.h"
+#include "envoy/network/address.h"
+
 #include "common/http/header_map_impl.h"
+
+#define EXPECT_THROW_WITH_MESSAGE(statement, expected_exception, message)                          \
+  try {                                                                                            \
+    statement;                                                                                     \
+    ADD_FAILURE() << "Exception should take place. It did not.";                                   \
+  } catch (expected_exception & e) {                                                               \
+    EXPECT_EQ(message, std::string(e.what()));                                                     \
+  }
 
 class TestUtility {
 public:
@@ -18,6 +29,44 @@ public:
    * @return std::string the converted string.
    */
   static std::string bufferToString(const Buffer::Instance& buffer);
+
+  /**
+   * Convert a string list of IP addresses into a list of network addresses usable for DNS
+   * response testing.
+   */
+  static std::list<Network::Address::InstanceConstSharedPtr>
+  makeDnsResponse(const std::list<std::string>& addresses);
+};
+
+/**
+ * This utility class wraps the common case of having a cross-thread "one shot" ready condition.
+ */
+class ConditionalInitializer {
+public:
+  /**
+   * Set the conditional to ready, should only be called once.
+   */
+  void setReady();
+
+  /**
+   * Block until the conditional is ready, will return immediately if it is already ready.
+   *
+   */
+  void waitReady();
+
+private:
+  std::condition_variable cv_;
+  std::mutex mutex_;
+  bool ready_{false};
+};
+
+class ScopedFdCloser {
+public:
+  ScopedFdCloser(int fd);
+  ~ScopedFdCloser();
+
+private:
+  int fd_;
 };
 
 namespace Http {

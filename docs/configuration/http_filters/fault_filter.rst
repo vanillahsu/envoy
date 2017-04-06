@@ -9,7 +9,8 @@ inject delays and abort requests with user-specified error codes, thereby
 providing the ability to stage different failure scenarios such as service
 failures, service overloads, high network latency, network partitions,
 etc. Faults injection can be limited to a specific set of requests based on
-a set of pre-defined request headers.
+the (destination) upstream cluster of a request and/or a set of pre-defined
+request headers.
 
 The scope of failures is restricted to those that are observable by an
 application communicating over the network. CPU and disk failures on the
@@ -17,7 +18,6 @@ local host cannot be emulated.
 
 Currently, the fault injection filter has the following limitations:
 
-* Faults will be injected on all configured routes in the Envoy instance
 * Abort codes are restricted to HTTP status codes only
 * Delays are restricted to fixed duration.
 
@@ -33,51 +33,86 @@ including the router filter.*
 
 .. code-block:: json
 
-    {
-      "type" : "decoder",
-      "name" : "fault",
-      "config" : {
-        "abort" : {
-          "abort_percent" : "...",
-          "http_status" : "..."
-        },
-        "delay" : {
-          "type" : "...",
-          "fixed_delay_percent" : "...",
-          "fixed_duration_ms" : "..."
-        },
-        "headers" : []
-      }
+  {
+    "type" : "decoder",
+    "name" : "fault",
+    "config" : {
+      "abort" : "{...}",
+      "delay" : "{...}",
+      "upstream_cluster" : "...",
+      "headers" : []
     }
+  }
 
-abort.abort_percent
-  *(required, integer)* The percentage of requests that
-  should be aborted with the specified *http_status* code. Valid values
-  range from 0 to 100.
+:ref:`abort <config_http_filters_fault_injection_abort>`
+  *(sometimes required, object)* If specified, the filter will abort requests based on
+  the values in the object. At least *abort* or *delay* must be specified.
 
-abort.http_status
-  *(required, integer)* The HTTP status code that will be used as the
-  response code for the request being aborted.
+:ref:`delay <config_http_filters_fault_injection_delay>`
+  *(sometimes required, object)* If specified, the filter will inject delays based on the values
+  in the object. At least *abort* or *delay* must be specified.
 
-delay.type:
-  *(required, string)* Specifies the type of delay being
-  injected. Currently only *fixed* delay type (step function) is supported.
+upstream_cluster:
+  *(optional, string)* Specifies the name of the (destination) upstream
+  cluster that the filter should match on. Fault injection will be
+  restricted to requests bound to the specific upstream cluster.
 
-delay.fixed_delay_percent:
-  *(required, integer)* The percentage of requests that will
-  be delayed for the duration specified by *fixed_duration_ms*. Valid
-  values range from 0 to 100.
-
-delay.fixed_duration_ms:
-  *(required, integer)* The delay duration in
-  milliseconds. Must be greater than 0.
-
-:ref:`headers <config_http_filters_fault_injection_headers>`
-  *(optional, array)* Specifies a set of headers that the filter should match on.
+:ref:`headers <config_http_conn_man_route_table_route_headers>`
+  *(optional, array)* Specifies a set of headers that the filter should match on. The fault
+  injection filter can be applied selectively to requests that match a set of headers specified in
+  the fault filter config. The chances of actual fault injection further depend on the values of
+  *abort_percent* and *fixed_delay_percent* parameters.The filter will check the request's headers
+  against all the specified headers in the filter config. A match will happen if all the headers in
+  the config are present in the request with the same values (or based on presence if the ``value``
+  field is not in the config).
 
 The abort and delay blocks can be omitted. If they are not specified in the
 configuration file, their respective values will be obtained from the
 runtime.
+
+.. _config_http_filters_fault_injection_abort:
+
+Abort
+-----
+.. code-block:: json
+
+  {
+    "abort_percent" : "...",
+    "http_status" : "..."
+  }
+
+abort_percent
+  *(required, integer)* The percentage of requests that
+  should be aborted with the specified *http_status* code. Valid values
+  range from 0 to 100.
+
+http_status
+  *(required, integer)* The HTTP status code that will be used as the
+  response code for the request being aborted.
+
+.. _config_http_filters_fault_injection_delay:
+
+Delay
+-----
+.. code-block:: json
+
+  {
+    "type" : "...",
+    "fixed_delay_percent" : "...",
+    "fixed_duration_ms" : "..."
+  }
+
+type:
+  *(required, string)* Specifies the type of delay being
+  injected. Currently only *fixed* delay type (step function) is supported.
+
+fixed_delay_percent:
+  *(required, integer)* The percentage of requests that will
+  be delayed for the duration specified by *fixed_duration_ms*. Valid
+  values range from 0 to 100.
+
+fixed_duration_ms:
+  *(required, integer)* The delay duration in milliseconds. Must be greater than 0.
 
 Runtime
 -------
@@ -105,41 +140,6 @@ http.fault.delay.fixed_duration_ms
   is missing from both the runtime and the config, no delays will be
   injected.
 
-.. _config_http_filters_fault_injection_headers:
-
-Headers
--------
-
-The fault injection filter can be applied selectively to requests that
-match a set of headers specified in the fault filter config. The chances of
-actual fault injection further depend on the values of *abort_percent* and
-*fixed_delay_percent* parameters. Each element of the array in the
-*headers* field should be in the following format:
-
-.. code-block:: json
-
-  [
-    {"name": "...", "value": "...", "regex": "..."}
-  ]
-
-name
-  *(required, string)* Specifies the name of the header in the request.
-
-value
-  *(optional, string)* Specifies the value of the header. If the value is
-  absent a request that has the *name* header will match, regardless of the
-  header's value.
-
-regex
-  *(optional, boolean)* Specifies whether the header value is a regular expression
-  or not. Defaults to false. The regex grammar used in the value field
-  is defined `here <http://en.cppreference.com/w/cpp/regex/ecmascript>`_.
-
-The filter will check the request's headers against all the specified
-headers in the filter config. A match will happen if all the headers in the
-config are present in the request with the same values (or based on
-presence if the ``value`` field is not in the config).
-
 Statistics
 ----------
 
@@ -152,4 +152,3 @@ prefix <config_http_conn_man_stat_prefix>` comes from the owning HTTP connection
 
   delays_injected, Counter, Total requests that were delayed
   aborts_injected, Counter, Total requests that were aborted
-

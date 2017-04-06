@@ -1,6 +1,7 @@
 #include "common/buffer/buffer_impl.h"
 #include "common/http/headers.h"
 #include "common/json/json_loader.h"
+#include "common/network/utility.h"
 #include "common/upstream/health_checker_impl.h"
 #include "common/upstream/upstream_impl.h"
 
@@ -11,6 +12,7 @@
 #include "test/test_common/utility.h"
 
 using testing::_;
+using testing::Invoke;
 using testing::NiceMock;
 using testing::Return;
 using testing::ReturnRef;
@@ -22,12 +24,12 @@ class TestHttpHealthCheckerImpl : public HttpHealthCheckerImpl {
 public:
   using HttpHealthCheckerImpl::HttpHealthCheckerImpl;
 
-  Http::CodecClient* createCodecClient(Upstream::Host::CreateConnectionData&) override {
-    return createCodecClient_();
+  Http::CodecClient* createCodecClient(Upstream::Host::CreateConnectionData& conn_data) override {
+    return createCodecClient_(conn_data);
   };
 
   // HttpHealthCheckerImpl
-  MOCK_METHOD0(createCodecClient_, Http::CodecClient*());
+  MOCK_METHOD1(createCodecClient_, Http::CodecClient*(Upstream::Host::CreateConnectionData&));
 };
 
 class HttpHealthCheckerImplTest : public testing::Test {
@@ -40,7 +42,6 @@ public:
     Http::MockClientConnection* codec_{};
     Stats::IsolatedStoreImpl stats_store_;
     Network::MockClientConnection* client_connection_{};
-    Http::CodecClient* codec_client_{};
     NiceMock<Http::MockStreamEncoder> request_encoder_;
     Http::StreamDecoder* stream_response_callbacks_{};
   };
@@ -65,7 +66,7 @@ public:
     Json::ObjectPtr config = Json::Factory::LoadFromString(json);
     health_checker_.reset(
         new TestHttpHealthCheckerImpl(*cluster_, *config, dispatcher_, runtime_, random_));
-    health_checker_->addHostCheckCompleteCb([this](HostPtr host, bool changed_state)
+    health_checker_->addHostCheckCompleteCb([this](HostSharedPtr host, bool changed_state)
                                                 -> void { onHostStatus(host, changed_state); });
   }
 
@@ -86,7 +87,7 @@ public:
     Json::ObjectPtr config = Json::Factory::LoadFromString(json);
     health_checker_.reset(
         new TestHttpHealthCheckerImpl(*cluster_, *config, dispatcher_, runtime_, random_));
-    health_checker_->addHostCheckCompleteCb([this](HostPtr host, bool changed_state)
+    health_checker_->addHostCheckCompleteCb([this](HostSharedPtr host, bool changed_state)
                                                 -> void { onHostStatus(host, changed_state); });
   }
 
@@ -103,14 +104,15 @@ public:
   void expectClientCreate(size_t index) {
     TestSession& test_session = *test_sessions_[index];
 
-    test_session.codec_ = new NiceMock<Http::MockClientConnection>();
+    auto* codec = test_session.codec_ = new NiceMock<Http::MockClientConnection>();
     test_session.client_connection_ = new NiceMock<Network::MockClientConnection>();
+    auto create_codec_client = [codec](Upstream::Host::CreateConnectionData& conn_data) {
+      return new CodecClientForTest(std::move(conn_data.connection_), codec, nullptr, nullptr);
+    };
 
-    Network::ClientConnectionPtr connection{test_session.client_connection_};
-    test_session.codec_client_ =
-        new CodecClientForTest(std::move(connection), test_session.codec_, nullptr, nullptr);
-    EXPECT_CALL(*health_checker_, createCodecClient_())
-        .WillOnce(Return(test_session.codec_client_));
+    EXPECT_CALL(dispatcher_, createClientConnection_(_))
+        .WillOnce(Return(test_session.client_connection_));
+    EXPECT_CALL(*health_checker_, createCodecClient_(_)).WillOnce(Invoke(create_codec_client));
   }
 
   void expectStreamCreate(size_t index) {
@@ -146,7 +148,7 @@ public:
     }
   }
 
-  MOCK_METHOD2(onHostStatus, void(HostPtr host, bool changed_state));
+  MOCK_METHOD2(onHostStatus, void(HostSharedPtr host, bool changed_state));
 
   std::shared_ptr<MockCluster> cluster_;
   NiceMock<Event::MockDispatcher> dispatcher_;
@@ -160,7 +162,8 @@ TEST_F(HttpHealthCheckerImplTest, Success) {
   setupNoServiceValidationHC();
   EXPECT_CALL(*this, onHostStatus(_, false)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->info_->stats().upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -181,7 +184,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceCheck) {
 
   EXPECT_CALL(*this, onHostStatus(_, false)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->info_->stats().upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -203,7 +207,8 @@ TEST_F(HttpHealthCheckerImplTest, ServiceDoesNotMatchFail) {
 
   EXPECT_CALL(*this, onHostStatus(_, true)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->info_->stats().upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -226,7 +231,8 @@ TEST_F(HttpHealthCheckerImplTest, ServiceNotPresentInResponseFail) {
 
   EXPECT_CALL(*this, onHostStatus(_, true)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->info_->stats().upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -248,7 +254,8 @@ TEST_F(HttpHealthCheckerImplTest, ServiceCheckRuntimeOff) {
 
   EXPECT_CALL(*this, onHostStatus(_, false)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->info_->stats().upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -267,7 +274,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedFailFirstServiceCheck) {
   setupNoServiceValidationHC();
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
       .WillRepeatedly(Return(true));
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->hosts_[0]->healthFlagSet(Host::HealthFlag::FAILED_ACTIVE_HC);
   expectSessionCreate();
   expectStreamCreate(0);
@@ -298,7 +306,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessNoTraffic) {
   setupNoServiceValidationHC();
   EXPECT_CALL(*this, onHostStatus(_, false)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectStreamCreate(0);
   health_checker_->start();
@@ -310,7 +319,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessNoTraffic) {
 
 TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedSuccessFirst) {
   setupNoServiceValidationHC();
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->hosts_[0]->healthFlagSet(Host::HealthFlag::FAILED_ACTIVE_HC);
   expectSessionCreate();
   expectStreamCreate(0);
@@ -327,7 +337,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedSuccessFirst) {
 
 TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedFailFirst) {
   setupNoServiceValidationHC();
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->hosts_[0]->healthFlagSet(Host::HealthFlag::FAILED_ACTIVE_HC);
   expectSessionCreate();
   expectStreamCreate(0);
@@ -355,7 +366,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedFailFirst) {
 
 TEST_F(HttpHealthCheckerImplTest, HttpFail) {
   setupNoServiceValidationHC();
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectStreamCreate(0);
   health_checker_->start();
@@ -383,7 +395,8 @@ TEST_F(HttpHealthCheckerImplTest, Disconnect) {
   setupNoServiceValidationHC();
   EXPECT_CALL(*this, onHostStatus(_, false)).Times(1);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectStreamCreate(0);
   health_checker_->start();
@@ -403,7 +416,8 @@ TEST_F(HttpHealthCheckerImplTest, Disconnect) {
 
 TEST_F(HttpHealthCheckerImplTest, Timeout) {
   setupNoServiceValidationHC();
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectStreamCreate(0);
   health_checker_->start();
@@ -429,10 +443,11 @@ TEST_F(HttpHealthCheckerImplTest, DynamicAddAndRemove) {
 
   expectSessionCreate();
   expectStreamCreate(0);
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->runCallbacks({cluster_->hosts_.back()}, {});
 
-  std::vector<HostPtr> removed{cluster_->hosts_.back()};
+  std::vector<HostSharedPtr> removed{cluster_->hosts_.back()};
   cluster_->hosts_.clear();
   EXPECT_CALL(*test_sessions_[0]->client_connection_, close(_));
   cluster_->runCallbacks({}, removed);
@@ -442,7 +457,8 @@ TEST_F(HttpHealthCheckerImplTest, ConnectionClose) {
   setupNoServiceValidationHC();
   EXPECT_CALL(*this, onHostStatus(_, false));
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectStreamCreate(0);
   health_checker_->start();
@@ -460,7 +476,8 @@ TEST_F(HttpHealthCheckerImplTest, RemoteCloseBetweenChecks) {
   setupNoServiceValidationHC();
   EXPECT_CALL(*this, onHostStatus(_, false)).Times(2);
 
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectStreamCreate(0);
   health_checker_->start();
@@ -605,13 +622,14 @@ public:
   Network::MockClientConnection* connection_{};
   Event::MockTimer* timeout_timer_{};
   Event::MockTimer* interval_timer_{};
-  Network::ReadFilterPtr read_filter_;
+  Network::ReadFilterSharedPtr read_filter_;
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Runtime::MockRandomGenerator> random_;
 };
 
 TEST_F(TcpHealthCheckerImplTest, Success) {
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   expectSessionCreate();
   expectClientCreate();
   health_checker_->start();
@@ -628,7 +646,8 @@ TEST_F(TcpHealthCheckerImplTest, Timeout) {
 
   expectSessionCreate();
   expectClientCreate();
-  cluster_->hosts_ = {HostPtr{new HostImpl(cluster_->info_, "tcp://127.0.0.1:80", false, 1, "")}};
+  cluster_->hosts_ = {HostSharedPtr{new HostImpl(
+      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")}};
   cluster_->runCallbacks({cluster_->hosts_.back()}, {});
 
   Buffer::OwnedImpl response;
@@ -653,7 +672,7 @@ TEST_F(TcpHealthCheckerImplTest, Timeout) {
   expectClientCreate();
   interval_timer_->callback_();
 
-  std::vector<HostPtr> removed{cluster_->hosts_.back()};
+  std::vector<HostSharedPtr> removed{cluster_->hosts_.back()};
   cluster_->hosts_.clear();
   EXPECT_CALL(*connection_, close(_));
   cluster_->runCallbacks({}, removed);

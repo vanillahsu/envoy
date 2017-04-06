@@ -1,7 +1,8 @@
-#include "mocks.h"
+#include "test/mocks/upstream/mocks.h"
 
 #include "envoy/upstream/load_balancer.h"
 
+#include "common/network/utility.h"
 #include "common/upstream/upstream_impl.h"
 
 using testing::_;
@@ -9,6 +10,7 @@ using testing::Invoke;
 using testing::Return;
 using testing::ReturnPointee;
 using testing::ReturnRef;
+using testing::SaveArg;
 
 namespace Upstream {
 namespace Outlier {
@@ -28,15 +30,22 @@ MockDetector::~MockDetector() {}
 
 } // Outlier
 
-MockHostDescription::MockHostDescription() {
-  ON_CALL(*this, url()).WillByDefault(ReturnRef(url_));
+MockHostDescription::MockHostDescription()
+    : address_(Network::Utility::resolveUrl("tcp://10.0.0.1:443")) {
+  ON_CALL(*this, hostname()).WillByDefault(ReturnRef(hostname_));
+  ON_CALL(*this, address()).WillByDefault(Return(address_));
   ON_CALL(*this, outlierDetector()).WillByDefault(ReturnRef(outlier_detector_));
   ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
+  ON_CALL(*this, cluster()).WillByDefault(ReturnRef(cluster_));
 }
 
 MockHostDescription::~MockHostDescription() {}
 
-MockHost::MockHost() {}
+MockHost::MockHost() {
+  ON_CALL(*this, cluster()).WillByDefault(ReturnRef(cluster_));
+  ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
+}
+
 MockHost::~MockHost() {}
 
 MockClusterInfo::MockClusterInfo()
@@ -52,7 +61,7 @@ MockClusterInfo::MockClusterInfo()
   ON_CALL(*this, resourceManager(_))
       .WillByDefault(Invoke([this](ResourcePriority)
                                 -> Upstream::ResourceManager& { return *resource_manager_; }));
-  ON_CALL(*this, lbType()).WillByDefault(Return(Upstream::LoadBalancerType::RoundRobin));
+  ON_CALL(*this, lbType()).WillByDefault(ReturnPointee(&lb_type_));
 }
 
 MockClusterInfo::~MockClusterInfo() {}
@@ -74,9 +83,26 @@ MockCluster::MockCluster() {
 
 MockCluster::~MockCluster() {}
 
+MockLoadBalancer::MockLoadBalancer() { ON_CALL(*this, chooseHost(_)).WillByDefault(Return(host_)); }
+
+MockLoadBalancer::~MockLoadBalancer() {}
+
+MockThreadLocalCluster::MockThreadLocalCluster() {
+  ON_CALL(*this, hostSet()).WillByDefault(ReturnRef(cluster_));
+  ON_CALL(*this, info()).WillByDefault(Return(cluster_.info_));
+  ON_CALL(*this, loadBalancer()).WillByDefault(ReturnRef(lb_));
+}
+
+MockThreadLocalCluster::~MockThreadLocalCluster() {}
+
 MockClusterManager::MockClusterManager() {
-  ON_CALL(*this, httpConnPoolForCluster(_, _)).WillByDefault(Return(&conn_pool_));
-  ON_CALL(*this, get(_)).WillByDefault(Return(cluster_.info_));
+  ON_CALL(*this, httpConnPoolForCluster(_, _, _)).WillByDefault(Return(&conn_pool_));
+  ON_CALL(*this, httpAsyncClientForCluster(_)).WillByDefault(ReturnRef(async_client_));
+  ON_CALL(*this, httpAsyncClientForCluster(_)).WillByDefault((ReturnRef(async_client_)));
+
+  // Matches are LIFO so "" will match first.
+  ON_CALL(*this, get(_)).WillByDefault(Return(&thread_local_cluster_));
+  ON_CALL(*this, get("")).WillByDefault(Return(nullptr));
 }
 
 MockClusterManager::~MockClusterManager() {}
@@ -87,5 +113,11 @@ MockHealthChecker::MockHealthChecker() {
 }
 
 MockHealthChecker::~MockHealthChecker() {}
+
+MockCdsApi::MockCdsApi() {
+  ON_CALL(*this, setInitializedCb(_)).WillByDefault(SaveArg<0>(&initialized_callback_));
+}
+
+MockCdsApi::~MockCdsApi() {}
 
 } // Upstream

@@ -12,6 +12,8 @@
 #include "common/stats/stats_impl.h"
 #include "server/connection_handler_impl.h"
 
+#include "test/test_common/utility.h"
+
 class FakeHttpConnection;
 
 /**
@@ -72,7 +74,7 @@ public:
 
 protected:
   FakeConnectionBase(Network::Connection& connection) : connection_(connection) {
-    connection.addConnectionCallbacks(*this);
+    connection_.dispatcher().post([this]() -> void { connection_.addConnectionCallbacks(*this); });
   }
 
   Network::Connection& connection_;
@@ -121,7 +123,7 @@ typedef std::unique_ptr<FakeHttpConnection> FakeHttpConnectionPtr;
 class FakeRawConnection : Logger::Loggable<Logger::Id::testing>, public FakeConnectionBase {
 public:
   FakeRawConnection(Network::Connection& connection) : FakeConnectionBase(connection) {
-    connection.addReadFilter(Network::ReadFilterPtr{new ReadFilter(*this)});
+    connection.addReadFilter(Network::ReadFilterSharedPtr{new ReadFilter(*this)});
   }
 
   void waitForData(uint64_t num_bytes);
@@ -155,9 +157,10 @@ public:
   FakeHttpConnection::Type httpType() { return http_type_; }
   FakeHttpConnectionPtr waitForHttpConnection(Event::Dispatcher& client_dispatcher);
   FakeRawConnectionPtr waitForRawConnection();
+  Network::Address::InstanceConstSharedPtr localAddress() const { return socket_->localAddress(); }
 
   // Network::FilterChainFactory
-  void createFilterChain(Network::Connection& connection) override;
+  bool createFilterChain(Network::Connection& connection) override;
 
 private:
   FakeUpstream(Ssl::ServerContext* ssl_ctx, Network::ListenSocketPtr&& connection,
@@ -166,7 +169,7 @@ private:
 
   Ssl::ServerContext* ssl_ctx_{};
   Network::ListenSocketPtr socket_;
-  Thread::ConditionalInitializer server_initialized_;
+  ConditionalInitializer server_initialized_;
   Thread::ThreadPtr thread_;
   std::mutex lock_;
   std::condition_variable new_connection_event_;

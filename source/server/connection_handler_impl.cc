@@ -1,4 +1,4 @@
-#include "connection_handler_impl.h"
+#include "server/connection_handler_impl.h"
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
@@ -9,30 +9,25 @@
 
 namespace Server {
 
-ConnectionHandlerImpl::ConnectionHandlerImpl(Stats::Store& stats_store, spdlog::logger& logger,
-                                             Api::ApiPtr&& api)
-    : stats_store_(stats_store), logger_(logger), api_(std::move(api)),
-      dispatcher_(api_->allocateDispatcher()),
-      watchdog_miss_counter_(stats_store.counter("server.watchdog_miss")),
-      watchdog_mega_miss_counter_(stats_store.counter("server.watchdog_mega_miss")) {}
+ConnectionHandlerImpl::ConnectionHandlerImpl(spdlog::logger& logger, Api::ApiPtr&& api)
+    : logger_(logger), api_(std::move(api)), dispatcher_(api_->allocateDispatcher()) {}
 
 ConnectionHandlerImpl::~ConnectionHandlerImpl() { closeConnections(); }
 
 void ConnectionHandlerImpl::addListener(Network::FilterChainFactory& factory,
-                                        Network::ListenSocket& socket, bool bind_to_port,
-                                        bool use_proxy_proto, bool use_orig_dst) {
-  ActiveListenerPtr l(
-      new ActiveListener(*this, socket, factory, bind_to_port, use_proxy_proto, use_orig_dst));
-  listeners_.insert(std::make_pair(socket.name(), std::move(l)));
+                                        Network::ListenSocket& socket, Stats::Scope& scope,
+                                        const Network::ListenerOptions& listener_options) {
+  ActiveListenerPtr l(new ActiveListener(*this, socket, factory, scope, listener_options));
+  listeners_.emplace_back(socket.localAddress(), std::move(l));
 }
 
 void ConnectionHandlerImpl::addSslListener(Network::FilterChainFactory& factory,
                                            Ssl::ServerContext& ssl_ctx,
-                                           Network::ListenSocket& socket, bool bind_to_port,
-                                           bool use_proxy_proto, bool use_orig_dst) {
-  ActiveListenerPtr l(new SslActiveListener(*this, ssl_ctx, socket, factory, bind_to_port,
-                                            use_proxy_proto, use_orig_dst));
-  listeners_.insert(std::make_pair(socket.name(), std::move(l)));
+                                           Network::ListenSocket& socket, Stats::Scope& scope,
+                                           const Network::ListenerOptions& listener_options) {
+  ActiveListenerPtr l(
+      new SslActiveListener(*this, ssl_ctx, socket, factory, scope, listener_options));
+  listeners_.emplace_back(socket.localAddress(), std::move(l));
 }
 
 void ConnectionHandlerImpl::closeConnections() {
@@ -44,8 +39,8 @@ void ConnectionHandlerImpl::closeConnections() {
 }
 
 void ConnectionHandlerImpl::closeListeners() {
-  for (auto& l : listeners_) {
-    l.second->listener_.reset();
+  for (auto& listener : listeners_) {
+    listener.second->listener_.reset();
   }
 }
 
@@ -56,51 +51,74 @@ void ConnectionHandlerImpl::removeConnection(ActiveConnection& connection) {
   num_connections_--;
 }
 
-ConnectionHandlerImpl::ActiveListener::ActiveListener(ConnectionHandlerImpl& parent,
-                                                      Network::ListenSocket& socket,
-                                                      Network::FilterChainFactory& factory,
-                                                      bool bind_to_port, bool use_proxy_proto,
-                                                      bool use_orig_dst)
-    : ActiveListener(parent, parent.dispatcher_->createListener(parent, socket, *this,
-                                                                parent.stats_store_, bind_to_port,
-                                                                use_proxy_proto, use_orig_dst),
-                     factory, socket.name()) {}
+ConnectionHandlerImpl::ActiveListener::ActiveListener(
+    ConnectionHandlerImpl& parent, Network::ListenSocket& socket,
+    Network::FilterChainFactory& factory, Stats::Scope& scope,
+    const Network::ListenerOptions& listener_options)
+    : ActiveListener(parent, parent.dispatcher_->createListener(parent, socket, *this, scope,
+                                                                listener_options),
+                     factory, scope) {}
 
 ConnectionHandlerImpl::ActiveListener::ActiveListener(ConnectionHandlerImpl& parent,
                                                       Network::ListenerPtr&& listener,
                                                       Network::FilterChainFactory& factory,
-                                                      const std::string& stats_prefix)
-    : parent_(parent), factory_(factory), stats_(generateStats(stats_prefix, parent.stats_store_)) {
+                                                      Stats::Scope& scope)
+    : parent_(parent), factory_(factory), stats_(generateStats(scope)) {
   listener_ = std::move(listener);
 }
 
-ConnectionHandlerImpl::SslActiveListener::SslActiveListener(ConnectionHandlerImpl& parent,
-                                                            Ssl::ServerContext& ssl_ctx,
-                                                            Network::ListenSocket& socket,
-                                                            Network::FilterChainFactory& factory,
-                                                            bool bind_to_port, bool use_proxy_proto,
-                                                            bool use_orig_dst)
-    : ActiveListener(parent, parent.dispatcher_->createSslListener(
-                                 parent, ssl_ctx, socket, *this, parent.stats_store_, bind_to_port,
-                                 use_proxy_proto, use_orig_dst),
-                     factory, socket.name()) {}
+ConnectionHandlerImpl::SslActiveListener::SslActiveListener(
+    ConnectionHandlerImpl& parent, Ssl::ServerContext& ssl_ctx, Network::ListenSocket& socket,
+    Network::FilterChainFactory& factory, Stats::Scope& scope,
+    const Network::ListenerOptions& listener_options)
+    : ActiveListener(parent, parent.dispatcher_->createSslListener(parent, ssl_ctx, socket, *this,
+                                                                   scope, listener_options),
+                     factory, scope) {}
 
-Network::Listener* ConnectionHandlerImpl::findListener(const std::string& socket_name) {
-  auto l = listeners_.find(socket_name);
-  return (l != listeners_.end()) ? l->second->listener_.get() : nullptr;
+Network::Listener*
+ConnectionHandlerImpl::findListenerByAddress(const Network::Address::Instance& address) {
+  // This is a linear operation, may need to add a map<address, listener> to improve performance.
+  // However, linear performance might be adequate since the number of listeners is small.
+  auto listener = std::find_if(
+      listeners_.begin(), listeners_.end(),
+      [&address](const std::pair<Network::Address::InstanceConstSharedPtr, ActiveListenerPtr>& p) {
+        return p.first->type() == Network::Address::Type::Ip && *(p.first) == address;
+      });
+
+  // If there is exact address match, return the corresponding listener.
+  if (listener != listeners_.end()) {
+    return listener->second->listener_.get();
+  }
+
+  // Otherwise, we need to look for the wild card match, i.e., 0.0.0.0:[address_port].
+  // TODO(wattli): consolidate with previous search for more efficiency.
+  listener = std::find_if(
+      listeners_.begin(), listeners_.end(),
+      [&address](const std::pair<Network::Address::InstanceConstSharedPtr, ActiveListenerPtr>& p) {
+        return p.first->type() == Network::Address::Type::Ip &&
+               p.first->ip()->port() == address.ip()->port() && p.first->ip()->isAnyAddress();
+      });
+  return (listener != listeners_.end()) ? listener->second->listener_.get() : nullptr;
 }
 
 void ConnectionHandlerImpl::ActiveListener::onNewConnection(
     Network::ConnectionPtr&& new_connection) {
   conn_log(parent_.logger_, info, "new connection", *new_connection);
-  factory_.createFilterChain(*new_connection);
+  bool empty_filter_chain = !factory_.createFilterChain(*new_connection);
 
   // If the connection is already closed, we can just let this connection immediately die.
   if (new_connection->state() != Network::Connection::State::Closed) {
-    ActiveConnectionPtr active_connection(
-        new ActiveConnection(parent_, std::move(new_connection), stats_));
-    active_connection->moveIntoList(std::move(active_connection), parent_.connections_);
-    parent_.num_connections_++;
+    // Close the connection if the filter chain is empty to avoid leaving open connections
+    // with nothing to do.
+    if (empty_filter_chain) {
+      conn_log(parent_.logger_, info, "closing connection: no filters", *new_connection);
+      new_connection->close(Network::ConnectionCloseType::NoFlush);
+    } else {
+      ActiveConnectionPtr active_connection(
+          new ActiveConnection(parent_, std::move(new_connection), stats_));
+      active_connection->moveIntoList(std::move(active_connection), parent_.connections_);
+      parent_.num_connections_++;
+    }
   }
 }
 
@@ -123,29 +141,8 @@ ConnectionHandlerImpl::ActiveConnection::~ActiveConnection() {
   conn_length_->complete();
 }
 
-ListenerStats ConnectionHandlerImpl::generateStats(const std::string& prefix, Stats::Store& store) {
-  std::string final_prefix = fmt::format("listener.{}.", prefix);
-  return {ALL_LISTENER_STATS(POOL_COUNTER_PREFIX(store, final_prefix),
-                             POOL_GAUGE_PREFIX(store, final_prefix),
-                             POOL_TIMER_PREFIX(store, final_prefix))};
-}
-
-void ConnectionHandlerImpl::startWatchdog() {
-  watchdog_timer_ = dispatcher_->createTimer([this]() -> void {
-    auto delta = std::chrono::system_clock::now() - last_watchdog_time_;
-    if (delta > std::chrono::milliseconds(200)) {
-      watchdog_miss_counter_.inc();
-    }
-    if (delta > std::chrono::milliseconds(1000)) {
-      watchdog_mega_miss_counter_.inc();
-    }
-
-    last_watchdog_time_ = std::chrono::system_clock::now();
-    watchdog_timer_->enableTimer(std::chrono::milliseconds(100));
-  });
-
-  last_watchdog_time_ = std::chrono::system_clock::now();
-  watchdog_timer_->enableTimer(std::chrono::milliseconds(100));
+ListenerStats ConnectionHandlerImpl::generateStats(Stats::Scope& scope) {
+  return {ALL_LISTENER_STATS(POOL_COUNTER(scope), POOL_GAUGE(scope), POOL_TIMER(scope))};
 }
 
 } // Server

@@ -1,17 +1,21 @@
-#include "listener_impl.h"
-#include "proxy_protocol.h"
+#include "common/network/proxy_protocol.h"
 
 #include "envoy/common/exception.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/file_event.h"
 #include "envoy/stats/stats.h"
 
+#include "common/common/empty_string.h"
+#include "common/network/address_impl.h"
+#include "common/network/listener_impl.h"
+#include "common/network/utility.h"
+
 namespace Network {
 
 const std::string ProxyProtocol::ActiveConnection::PROXY_TCP4 = "PROXY TCP4 ";
 
-ProxyProtocol::ProxyProtocol(Stats::Store& stats_store)
-    : stats_{ALL_PROXY_PROTOCOL_STATS(POOL_COUNTER(stats_store))} {}
+ProxyProtocol::ProxyProtocol(Stats::Scope& scope)
+    : stats_{ALL_PROXY_PROTOCOL_STATS(POOL_COUNTER(scope))} {}
 
 void ProxyProtocol::newConnection(Event::Dispatcher& dispatcher, int fd, ListenerImpl& listener) {
   std::unique_ptr<ActiveConnection> p{new ActiveConnection(*this, dispatcher, fd, listener)};
@@ -23,10 +27,10 @@ ProxyProtocol::ActiveConnection::ActiveConnection(ProxyProtocol& parent,
                                                   ListenerImpl& listener)
     : parent_(parent), fd_(fd), listener_(listener), search_index_(1) {
   file_event_ = dispatcher.createFileEvent(fd, [this](uint32_t events) {
-    if (events & Event::FileReadyType::Read) {
-      onRead();
-    }
-  });
+    ASSERT(events == Event::FileReadyType::Read);
+    UNREFERENCED_PARAMETER(events);
+    onRead();
+  }, Event::FileTriggerType::Edge, Event::FileReadyType::Read);
 }
 
 ProxyProtocol::ActiveConnection::~ActiveConnection() {
@@ -68,7 +72,12 @@ void ProxyProtocol::ActiveConnection::onReadWorker() {
 
   removeFromList(parent_.connections_);
 
-  listener.newConnection(fd, remote_address);
+  // TODO(mattklein123): Parse the remote port instead of passing zero.
+  // TODO(mattklein123): IPv6 support.
+  listener.newConnection(fd,
+                         Network::Address::InstanceConstSharedPtr{
+                             new Network::Address::Ipv4Instance(remote_address, 0)},
+                         listener.socket().localAddress());
 }
 
 void ProxyProtocol::ActiveConnection::close() {

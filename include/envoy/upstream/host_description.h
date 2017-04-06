@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/network/address.h"
 #include "envoy/stats/stats_macros.h"
 #include "envoy/upstream/outlier_detection.h"
 
@@ -50,9 +51,15 @@ public:
   virtual Outlier::DetectorHostSink& outlierDetector() const PURE;
 
   /**
-   * @return the URL used to connect to the host.
+   * @return the hostname associated with the host if any.
+   * Empty string "" indicates that hostname is not a DNS name.
    */
-  virtual const std::string& url() const PURE;
+  virtual const std::string& hostname() const PURE;
+
+  /**
+   * @return the address used to connect to the host.
+   */
+  virtual Network::Address::InstanceConstSharedPtr address() const PURE;
 
   /**
    * @return host specific stats.
@@ -65,6 +72,6 @@ public:
   virtual const std::string& zone() const PURE;
 };
 
-typedef std::shared_ptr<const HostDescription> HostDescriptionPtr;
+typedef std::shared_ptr<const HostDescription> HostDescriptionConstSharedPtr;
 
 } // Upstream

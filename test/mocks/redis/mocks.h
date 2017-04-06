@@ -1,6 +1,9 @@
 #pragma once
 
+#include "envoy/redis/command_splitter.h"
 #include "envoy/redis/conn_pool.h"
+
+#include "common/redis/codec_impl.h"
 
 namespace Redis {
 
@@ -12,6 +15,9 @@ public:
   ~MockEncoder();
 
   MOCK_METHOD2(encode, void(const RespValue& value, Buffer::Instance& out));
+
+private:
+  EncoderImpl real_encoder_;
 };
 
 class MockDecoder : public Decoder {
@@ -37,24 +43,23 @@ public:
 
   MOCK_METHOD1(addConnectionCallbacks, void(Network::ConnectionCallbacks& callbacks));
   MOCK_METHOD0(close, void());
-  MOCK_METHOD2(makeRequest,
-               ActiveRequest*(const RespValue& request, ActiveRequestCallbacks& callbacks));
+  MOCK_METHOD2(makeRequest, PoolRequest*(const RespValue& request, PoolCallbacks& callbacks));
 
   std::list<Network::ConnectionCallbacks*> callbacks_;
 };
 
-class MockActiveRequest : public ActiveRequest {
+class MockPoolRequest : public PoolRequest {
 public:
-  MockActiveRequest();
-  ~MockActiveRequest();
+  MockPoolRequest();
+  ~MockPoolRequest();
 
   MOCK_METHOD0(cancel, void());
 };
 
-class MockActiveRequestCallbacks : public ActiveRequestCallbacks {
+class MockPoolCallbacks : public PoolCallbacks {
 public:
-  MockActiveRequestCallbacks();
-  ~MockActiveRequestCallbacks();
+  MockPoolCallbacks();
+  ~MockPoolCallbacks();
 
   void onResponse(RespValuePtr&& value) override { onResponse_(value); }
 
@@ -67,9 +72,43 @@ public:
   MockInstance();
   ~MockInstance();
 
-  MOCK_METHOD3(makeRequest, ActiveRequest*(const std::string& hash_key, const RespValue& request,
-                                           ActiveRequestCallbacks& callbacks));
+  MOCK_METHOD3(makeRequest, PoolRequest*(const std::string& hash_key, const RespValue& request,
+                                         PoolCallbacks& callbacks));
 };
 
 } // ConnPool
+
+namespace CommandSplitter {
+
+class MockSplitRequest : public SplitRequest {
+public:
+  MockSplitRequest();
+  ~MockSplitRequest();
+
+  MOCK_METHOD0(cancel, void());
+};
+
+class MockSplitCallbacks : public SplitCallbacks {
+public:
+  MockSplitCallbacks();
+  ~MockSplitCallbacks();
+
+  void onResponse(RespValuePtr&& value) override { onResponse_(value); }
+
+  MOCK_METHOD1(onResponse_, void(RespValuePtr& value));
+};
+
+class MockInstance : public Instance {
+public:
+  MockInstance();
+  ~MockInstance();
+
+  SplitRequestPtr makeRequest(const RespValue& request, SplitCallbacks& callbacks) override {
+    return SplitRequestPtr{makeRequest_(request, callbacks)};
+  }
+
+  MOCK_METHOD2(makeRequest_, SplitRequest*(const RespValue& request, SplitCallbacks& callbacks));
+};
+
+} // CommandSplitter
 } // Redis

@@ -20,6 +20,10 @@ public:
   static std::string version();
 
 private:
+  struct Flags {
+    static const uint64_t INITIALIZING = 0x1;
+  };
+
   SharedMemory() {}
 
   /**
@@ -37,9 +41,11 @@ private:
 
   uint64_t size_;
   uint64_t version_;
+  std::atomic<uint64_t> flags_;
   pthread_mutex_t log_lock_;
   pthread_mutex_t access_log_lock_;
   pthread_mutex_t stat_lock_;
+  pthread_mutex_t init_lock_;
   std::array<Stats::RawStatData, 16384> stats_slots_;
 
   friend class HotRestartImpl;
@@ -63,6 +69,20 @@ public:
     }
   }
 
+  bool try_lock() override {
+    int rc = pthread_mutex_trylock(&mutex_);
+    if (rc == EBUSY) {
+      return false;
+    }
+
+    ASSERT(rc == 0 || rc == EOWNERDEAD);
+    if (rc == EOWNERDEAD) {
+      pthread_mutex_consistent(&mutex_);
+    }
+
+    return true;
+  }
+
   void unlock() override {
     int rc = pthread_mutex_unlock(&mutex_);
     ASSERT(rc == 0);
@@ -81,15 +101,13 @@ class HotRestartImpl : public HotRestart,
                        Logger::Loggable<Logger::Id::main> {
 public:
   HotRestartImpl(Options& options);
-  ~HotRestartImpl();
 
   Thread::BasicLockable& logLock() { return log_lock_; }
   Thread::BasicLockable& accessLogLock() { return access_log_lock_; }
-  Thread::BasicLockable& statLock() { return stat_lock_; }
 
   // Server::HotRestart
   void drainParentListeners() override;
-  int duplicateParentListenSocket(uint32_t port) override;
+  int duplicateParentListenSocket(const std::string& address) override;
   void getParentStats(GetParentStatsInfo& info) override;
   void initialize(Event::Dispatcher& dispatcher, Server::Instance& server) override;
   void shutdownParentAdmin(ShutdownParentAdminInfo& info) override;
@@ -98,6 +116,7 @@ public:
 
   // RawStatDataAllocator
   Stats::RawStatData* alloc(const std::string& name) override;
+  void free(Stats::RawStatData& data) override;
 
 private:
   enum class RpcMessageType {
@@ -123,7 +142,7 @@ private:
   struct RpcGetListenSocketRequest : public RpcBase {
     RpcGetListenSocketRequest() : RpcBase(RpcMessageType::GetListenSocketRequest, sizeof(*this)) {}
 
-    uint32_t port_;
+    char address_[256];
   };
 
   struct RpcGetListenSocketReply : public RpcBase {
@@ -165,6 +184,7 @@ private:
   ProcessSharedMutex log_lock_;
   ProcessSharedMutex access_log_lock_;
   ProcessSharedMutex stat_lock_;
+  ProcessSharedMutex init_lock_;
   int my_domain_socket_{-1};
   sockaddr_un parent_address_;
   sockaddr_un child_address_;

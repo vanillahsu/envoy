@@ -1,4 +1,5 @@
 #include "common/http/http2/conn_pool.h"
+#include "common/network/utility.h"
 #include "common/upstream/upstream_impl.h"
 
 #include "test/common/http/common.h"
@@ -53,8 +54,8 @@ public:
 
   ~Http2ConnPoolImplTest() {
     // Make sure all gauges are 0.
-    for (Stats::Gauge& gauge : cluster_->stats_store_.gauges()) {
-      EXPECT_EQ(0U, gauge.value());
+    for (Stats::GaugeSharedPtr gauge : cluster_->stats_store_.gauges()) {
+      EXPECT_EQ(0U, gauge->value());
     }
   }
 
@@ -86,7 +87,8 @@ public:
 
   NiceMock<Event::MockDispatcher> dispatcher_;
   std::shared_ptr<Upstream::MockClusterInfo> cluster_{new NiceMock<Upstream::MockClusterInfo>()};
-  Upstream::HostPtr host_{new Upstream::HostImpl(cluster_, "tcp://127.0.0.1:80", false, 1, "")};
+  Upstream::HostSharedPtr host_{new Upstream::HostImpl(
+      cluster_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), false, 1, "")};
   TestConnPoolImpl pool_;
   std::vector<TestCodecClient> test_clients_;
   NiceMock<Runtime::MockLoader> runtime_;
@@ -111,6 +113,26 @@ TEST_F(Http2ConnPoolImplTest, VerifyConnectionTimingStats) {
   expectClientCreate();
   EXPECT_CALL(cluster_->stats_store_, deliverTimingToSinks("upstream_cx_connect_ms", _));
   EXPECT_CALL(cluster_->stats_store_, deliverTimingToSinks("upstream_cx_length_ms", _));
+
+  ActiveTestRequest r1(*this, 0);
+  EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
+  r1.callbacks_.outer_encoder_->encodeHeaders(HeaderMapImpl{}, true);
+  expectClientConnect(0);
+  EXPECT_CALL(r1.decoder_, decodeHeaders_(_, true));
+  r1.inner_decoder_->decodeHeaders(HeaderMapPtr{new HeaderMapImpl{}}, true);
+
+  test_clients_[0].connection_->raiseEvents(Network::ConnectionEvent::RemoteClose);
+  EXPECT_CALL(*this, onClientDestroy());
+  dispatcher_.clearDeferredDeleteList();
+}
+
+/**
+ * Test that buffer limits are set.
+ */
+TEST_F(Http2ConnPoolImplTest, VerifyBufferLimits) {
+  expectClientCreate();
+  EXPECT_CALL(*cluster_, perConnectionBufferLimitBytes()).WillOnce(Return(8192));
+  EXPECT_CALL(*test_clients_.back().connection_, setReadBufferLimit(8192));
 
   ActiveTestRequest r1(*this, 0);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));

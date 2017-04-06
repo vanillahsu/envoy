@@ -28,7 +28,7 @@ public:
   testing::NiceMock<Event::MockDispatcher> dispatcher_;
   std::list<Network::ConnectionCallbacks*> callbacks_;
   uint64_t id_{next_id_++};
-  std::string remote_address_;
+  Address::InstanceConstSharedPtr remote_address_;
   bool read_enabled_{true};
   Connection::State state_{Connection::State::Open};
 };
@@ -40,22 +40,25 @@ public:
 
   // Network::Connection
   MOCK_METHOD1(addConnectionCallbacks, void(ConnectionCallbacks& cb));
-  MOCK_METHOD1(addWriteFilter, void(WriteFilterPtr filter));
-  MOCK_METHOD1(addFilter, void(FilterPtr filter));
-  MOCK_METHOD1(addReadFilter, void(ReadFilterPtr filter));
+  MOCK_METHOD1(addWriteFilter, void(WriteFilterSharedPtr filter));
+  MOCK_METHOD1(addFilter, void(FilterSharedPtr filter));
+  MOCK_METHOD1(addReadFilter, void(ReadFilterSharedPtr filter));
   MOCK_METHOD1(close, void(ConnectionCloseType type));
   MOCK_METHOD0(dispatcher, Event::Dispatcher&());
   MOCK_METHOD0(id, uint64_t());
-  MOCK_METHOD0(initializeReadFilters, void());
+  MOCK_METHOD0(initializeReadFilters, bool());
   MOCK_METHOD0(nextProtocol, std::string());
   MOCK_METHOD1(noDelay, void(bool enable));
   MOCK_METHOD1(readDisable, void(bool disable));
   MOCK_METHOD0(readEnabled, bool());
-  MOCK_METHOD0(remoteAddress, const std::string&());
+  MOCK_METHOD0(remoteAddress, const Address::Instance&());
+  MOCK_METHOD0(localAddress, const Address::Instance&());
   MOCK_METHOD1(setBufferStats, void(const BufferStats& stats));
   MOCK_METHOD0(ssl, Ssl::Connection*());
   MOCK_METHOD0(state, State());
   MOCK_METHOD1(write, void(Buffer::Instance& data));
+  MOCK_METHOD1(setReadBufferLimit, void(uint32_t limit));
+  MOCK_CONST_METHOD0(readBufferLimit, uint32_t());
 };
 
 /**
@@ -69,22 +72,25 @@ public:
 
   // Network::Connection
   MOCK_METHOD1(addConnectionCallbacks, void(ConnectionCallbacks& cb));
-  MOCK_METHOD1(addWriteFilter, void(WriteFilterPtr filter));
-  MOCK_METHOD1(addFilter, void(FilterPtr filter));
-  MOCK_METHOD1(addReadFilter, void(ReadFilterPtr filter));
+  MOCK_METHOD1(addWriteFilter, void(WriteFilterSharedPtr filter));
+  MOCK_METHOD1(addFilter, void(FilterSharedPtr filter));
+  MOCK_METHOD1(addReadFilter, void(ReadFilterSharedPtr filter));
   MOCK_METHOD1(close, void(ConnectionCloseType type));
   MOCK_METHOD0(dispatcher, Event::Dispatcher&());
   MOCK_METHOD0(id, uint64_t());
-  MOCK_METHOD0(initializeReadFilters, void());
+  MOCK_METHOD0(initializeReadFilters, bool());
   MOCK_METHOD0(nextProtocol, std::string());
   MOCK_METHOD1(noDelay, void(bool enable));
   MOCK_METHOD1(readDisable, void(bool disable));
   MOCK_METHOD0(readEnabled, bool());
-  MOCK_METHOD0(remoteAddress, const std::string&());
+  MOCK_METHOD0(remoteAddress, const Address::Instance&());
+  MOCK_METHOD0(localAddress, const Address::Instance&());
   MOCK_METHOD1(setBufferStats, void(const BufferStats& stats));
   MOCK_METHOD0(ssl, Ssl::Connection*());
   MOCK_METHOD0(state, State());
   MOCK_METHOD1(write, void(Buffer::Instance& data));
+  MOCK_METHOD1(setReadBufferLimit, void(uint32_t limit));
+  MOCK_CONST_METHOD0(readBufferLimit, uint32_t());
 
   // Network::ClientConnection
   MOCK_METHOD0(connect, void());
@@ -105,7 +111,7 @@ public:
   ~MockDnsResolver();
 
   // Network::DnsResolver
-  MOCK_METHOD2(resolve, ActiveDnsQuery&(const std::string& dns_name, ResolveCb callback));
+  MOCK_METHOD2(resolve, ActiveDnsQuery*(const std::string& dns_name, ResolveCb callback));
 
   testing::NiceMock<MockActiveDnsQuery> active_query_;
 };
@@ -117,11 +123,11 @@ public:
 
   MOCK_METHOD0(connection, Connection&());
   MOCK_METHOD0(continueReading, void());
-  MOCK_METHOD0(upstreamHost, Upstream::HostDescriptionPtr());
-  MOCK_METHOD1(upstreamHost, void(Upstream::HostDescriptionPtr host));
+  MOCK_METHOD0(upstreamHost, Upstream::HostDescriptionConstSharedPtr());
+  MOCK_METHOD1(upstreamHost, void(Upstream::HostDescriptionConstSharedPtr host));
 
   testing::NiceMock<MockConnection> connection_;
-  Upstream::HostDescriptionPtr host_;
+  Upstream::HostDescriptionConstSharedPtr host_;
 };
 
 class MockReadFilter : public ReadFilter {
@@ -180,7 +186,7 @@ public:
   MockFilterChainFactory();
   ~MockFilterChainFactory();
 
-  MOCK_METHOD1(createFilterChain, void(Connection& connection));
+  MOCK_METHOD1(createFilterChain, bool(Connection& connection));
 };
 
 class MockListenSocket : public ListenSocket {
@@ -188,9 +194,11 @@ public:
   MockListenSocket();
   ~MockListenSocket();
 
-  MOCK_METHOD0(name, const std::string());
+  MOCK_CONST_METHOD0(localAddress, Address::InstanceConstSharedPtr());
   MOCK_METHOD0(fd, int());
   MOCK_METHOD0(close, void());
+
+  Address::InstanceConstSharedPtr local_address_;
 };
 
 class MockListener : public Listener {
@@ -205,13 +213,15 @@ public:
   ~MockConnectionHandler();
 
   MOCK_METHOD0(numConnections, uint64_t());
-  MOCK_METHOD5(addListener,
+  MOCK_METHOD4(addListener,
                void(Network::FilterChainFactory& factory, Network::ListenSocket& socket,
-                    bool bind_to_port, bool use_proxy_proto, bool use_orig_dst));
-  MOCK_METHOD6(addSslListener, void(Network::FilterChainFactory& factory,
-                                    Ssl::ServerContext& ssl_ctx, Network::ListenSocket& socket,
-                                    bool bind_to_port, bool use_proxy_proto, bool use_orig_dst));
-  MOCK_METHOD1(findListener, Network::Listener*(const std::string& socket_name));
+                    Stats::Scope& scope, const Network::ListenerOptions& listener_options));
+  MOCK_METHOD5(addSslListener,
+               void(Network::FilterChainFactory& factory, Ssl::ServerContext& ssl_ctx,
+                    Network::ListenSocket& socket, Stats::Scope& scope,
+                    const Network::ListenerOptions& listener_options));
+  MOCK_METHOD1(findListenerByAddress,
+               Network::Listener*(const Network::Address::Instance& address));
   MOCK_METHOD0(closeListeners, void());
 };
 

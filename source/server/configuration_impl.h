@@ -7,7 +7,7 @@
 
 #include "common/common/logger.h"
 #include "common/json/json_loader.h"
-#include "common/stats/stats_scope_impl.h"
+#include "common/network/utility.h"
 
 namespace Server {
 namespace Configuration {
@@ -44,7 +44,7 @@ public:
    * Given a connection and a list of factories, create a new filter chain. Chain creation will
    * exit early if any filters immediately close the connection.
    */
-  static void buildFilterChain(Network::FilterManager& filter_manager,
+  static bool buildFilterChain(Network::FilterManager& filter_manager,
                                const std::list<NetworkFilterFactoryCb>& factories);
 };
 
@@ -74,6 +74,14 @@ public:
   Optional<std::string> statsdTcpClusterName() override { return statsd_tcp_cluster_name_; }
   Optional<uint32_t> statsdUdpPort() override { return statsd_udp_port_; }
   std::chrono::milliseconds statsFlushInterval() override { return stats_flush_interval_; }
+  std::chrono::milliseconds wdMissTimeout() const override { return watchdog_miss_timeout_; }
+  std::chrono::milliseconds wdMegaMissTimeout() const override {
+    return watchdog_megamiss_timeout_;
+  }
+  std::chrono::milliseconds wdKillTimeout() const override { return watchdog_kill_timeout_; }
+  std::chrono::milliseconds wdMultiKillTimeout() const override {
+    return watchdog_multikill_timeout_;
+  }
 
 private:
   /**
@@ -91,23 +99,26 @@ private:
 
     // Server::Configuration::Listener
     Network::FilterChainFactory& filterChainFactory() override { return *this; }
-    uint64_t port() override { return port_; }
+    Network::Address::InstanceConstSharedPtr address() override { return address_; }
     bool bindToPort() override { return bind_to_port_; }
     Ssl::ServerContext* sslContext() override { return ssl_context_.get(); }
     bool useProxyProto() override { return use_proxy_proto_; }
     bool useOriginalDst() override { return use_original_dst_; }
+    uint32_t perConnectionBufferLimitBytes() override { return per_connection_buffer_limit_bytes_; }
+    Stats::Scope& scope() override { return *scope_; }
 
     // Network::FilterChainFactory
-    void createFilterChain(Network::Connection& connection) override;
+    bool createFilterChain(Network::Connection& connection) override;
 
   private:
     MainImpl& parent_;
-    uint64_t port_;
+    Network::Address::InstanceConstSharedPtr address_;
     bool bind_to_port_{};
-    Stats::ScopeImpl scope_;
+    Stats::ScopePtr scope_;
     Ssl::ServerContextPtr ssl_context_;
     bool use_proxy_proto_{};
     bool use_original_dst_{};
+    uint32_t per_connection_buffer_limit_bytes_{};
     std::list<NetworkFilterFactoryCb> filter_factories_;
   };
 
@@ -125,6 +136,10 @@ private:
   Optional<uint32_t> statsd_udp_port_;
   RateLimit::ClientFactoryPtr ratelimit_client_factory_;
   std::chrono::milliseconds stats_flush_interval_;
+  std::chrono::milliseconds watchdog_miss_timeout_;
+  std::chrono::milliseconds watchdog_megamiss_timeout_;
+  std::chrono::milliseconds watchdog_kill_timeout_;
+  std::chrono::milliseconds watchdog_multikill_timeout_;
 };
 
 /**
@@ -146,18 +161,20 @@ public:
   InitialImpl(const Json::Object& json);
 
   // Server::Configuration::Initial
-  Admin& admin() { return admin_; }
-  Optional<std::string> flagsPath() { return flags_path_; }
+  Admin& admin() override { return admin_; }
+  Optional<std::string> flagsPath() override { return flags_path_; }
   Runtime* runtime() override { return runtime_.get(); }
 
 private:
   struct AdminImpl : public Admin {
     // Server::Configuration::Initial::Admin
-    const std::string& accessLogPath() { return access_log_path_; }
-    uint32_t port() override { return port_; }
+    const std::string& accessLogPath() override { return access_log_path_; }
+    const std::string& profilePath() override { return profile_path_; }
+    Network::Address::InstanceConstSharedPtr address() override { return address_; }
 
     std::string access_log_path_;
-    uint32_t port_;
+    std::string profile_path_;
+    Network::Address::InstanceConstSharedPtr address_;
   };
 
   struct RuntimeImpl : public Runtime {

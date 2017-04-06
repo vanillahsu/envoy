@@ -1,7 +1,5 @@
 #pragma once
 
-#include "sds.h"
-
 #include "envoy/http/codes.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/runtime/runtime.h"
@@ -10,6 +8,7 @@
 
 #include "common/http/async_client_impl.h"
 #include "common/json/json_loader.h"
+#include "common/upstream/sds.h"
 
 namespace Upstream {
 
@@ -30,11 +29,12 @@ public:
 
   // Upstream::ClusterManagerFactory
   Http::ConnectionPool::InstancePtr allocateConnPool(Event::Dispatcher& dispatcher,
-                                                     ConstHostPtr host,
+                                                     HostConstSharedPtr host,
                                                      ResourcePriority priority) override;
   ClusterPtr clusterFromJson(const Json::Object& cluster, ClusterManager& cm,
                              const Optional<SdsConfig>& sds_config,
-                             Outlier::EventLoggerPtr outlier_event_logger) override;
+                             Outlier::EventLoggerSharedPtr outlier_event_logger) override;
+  CdsApiPtr createCds(const Json::Object& config, ClusterManager& cm) override;
 
 private:
   Runtime::Loader& runtime_;
@@ -45,6 +45,55 @@ private:
   Ssl::ContextManager& ssl_context_manager_;
   Event::Dispatcher& primary_dispatcher_;
   const LocalInfo::LocalInfo& local_info_;
+};
+
+/**
+ * This is a helper class used during cluster management initialization. Dealing with primary
+ * clusters, secondary clusters, and CDS, is quite complicated, so this makes it easier to test.
+ */
+class ClusterManagerInitHelper : Logger::Loggable<Logger::Id::upstream> {
+public:
+  void addCluster(Cluster& cluster);
+  void onStaticLoadComplete();
+  void removeCluster(Cluster& cluster);
+  void setCds(CdsApi* cds);
+  void setInitializedCb(std::function<void()> callback);
+
+private:
+  enum class State {
+    Loading,
+    WaitingForStaticInitialize,
+    WaitingForCdsInitialize,
+    CdsInitialized,
+    AllClustersInitialized
+  };
+
+  void maybeFinishInitialize();
+
+  CdsApi* cds_{};
+  std::function<void()> initialized_callback_;
+  std::list<Cluster*> primary_init_clusters_;
+  std::list<Cluster*> secondary_init_clusters_;
+  State state_{State::Loading};
+  bool started_secondary_initialize_{};
+};
+
+/**
+ * All cluster manager stats. @see stats_macros.h
+ */
+// clang-format off
+#define ALL_CLUSTER_MANAGER_STATS(COUNTER, GAUGE)                                                  \
+  COUNTER(cluster_added)                                                                           \
+  COUNTER(cluster_modified)                                                                        \
+  COUNTER(cluster_removed)                                                                         \
+  GAUGE  (total_clusters)
+// clang-format on
+
+/**
+ * Struct definition for all cluster manager stats. @see stats_macros.h
+ */
+struct ClusterManagerStats {
+  ALL_CLUSTER_MANAGER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
 
 /**
@@ -61,11 +110,7 @@ public:
   // Upstream::ClusterManager
   bool addOrUpdatePrimaryCluster(const Json::Object& config) override;
   void setInitializedCb(std::function<void()> callback) override {
-    if (pending_cluster_init_ == 0) {
-      callback();
-    } else {
-      initialized_callback_ = callback;
-    }
+    init_helper_.setInitializedCb(callback);
   }
   ClusterInfoMap clusters() override {
     ClusterInfoMap clusters_map;
@@ -75,13 +120,17 @@ public:
 
     return clusters_map;
   }
-  ClusterInfoPtr get(const std::string& cluster) override;
+  ThreadLocalCluster* get(const std::string& cluster) override;
   Http::ConnectionPool::Instance* httpConnPoolForCluster(const std::string& cluster,
-                                                         ResourcePriority priority) override;
+                                                         ResourcePriority priority,
+                                                         LoadBalancerContext* context) override;
   Host::CreateConnectionData tcpConnForCluster(const std::string& cluster) override;
   Http::AsyncClient& httpAsyncClientForCluster(const std::string& cluster) override;
   bool removePrimaryCluster(const std::string& cluster) override;
-  void shutdown() override { primary_clusters_.clear(); }
+  void shutdown() override {
+    cds_api_.reset();
+    primary_clusters_.clear();
+  }
 
 private:
   /**
@@ -97,15 +146,22 @@ private:
       uint64_t drains_remaining_{};
     };
 
-    struct ClusterEntry {
-      ClusterEntry(ThreadLocalClusterManagerImpl& parent, ClusterInfoPtr cluster);
+    struct ClusterEntry : public ThreadLocalCluster {
+      ClusterEntry(ThreadLocalClusterManagerImpl& parent, ClusterInfoConstSharedPtr cluster);
+      ~ClusterEntry();
 
-      Http::ConnectionPool::Instance* connPool(ResourcePriority priority);
+      Http::ConnectionPool::Instance* connPool(ResourcePriority priority,
+                                               LoadBalancerContext* context);
+
+      // Upstream::ThreadLocalCluster
+      const HostSet& hostSet() override { return host_set_; }
+      ClusterInfoConstSharedPtr info() override { return cluster_info_; }
+      LoadBalancer& loadBalancer() override { return *lb_; }
 
       ThreadLocalClusterManagerImpl& parent_;
       HostSetImpl host_set_;
       LoadBalancerPtr lb_;
-      ClusterInfoPtr cluster_info_;
+      ClusterInfoConstSharedPtr cluster_info_;
       Http::AsyncClientImpl http_async_client_;
     };
 
@@ -113,13 +169,15 @@ private:
 
     ThreadLocalClusterManagerImpl(ClusterManagerImpl& parent, Event::Dispatcher& dispatcher,
                                   const Optional<std::string>& local_cluster_name);
-    void drainConnPools(HostPtr old_host, ConnPoolsContainer& container);
-    static void updateClusterMembership(const std::string& name, ConstHostVectorPtr hosts,
-                                        ConstHostVectorPtr healthy_hosts,
-                                        ConstHostListsPtr hosts_per_zone,
-                                        ConstHostListsPtr healthy_hosts_per_zone,
-                                        const std::vector<HostPtr>& hosts_added,
-                                        const std::vector<HostPtr>& hosts_removed,
+    ~ThreadLocalClusterManagerImpl();
+    void drainConnPools(const std::vector<HostSharedPtr>& hosts);
+    void drainConnPools(HostSharedPtr old_host, ConnPoolsContainer& container);
+    static void updateClusterMembership(const std::string& name, HostVectorConstSharedPtr hosts,
+                                        HostVectorConstSharedPtr healthy_hosts,
+                                        HostListsConstSharedPtr hosts_per_zone,
+                                        HostListsConstSharedPtr healthy_hosts_per_zone,
+                                        const std::vector<HostSharedPtr>& hosts_added,
+                                        const std::vector<HostSharedPtr>& hosts_removed,
                                         ThreadLocal::Instance& tls, uint32_t thread_local_slot);
 
     // ThreadLocal::ThreadLocalObject
@@ -128,7 +186,7 @@ private:
     ClusterManagerImpl& parent_;
     Event::Dispatcher& thread_local_dispatcher_;
     std::unordered_map<std::string, ClusterEntryPtr> thread_local_clusters_;
-    std::unordered_map<ConstHostPtr, ConnPoolsContainer> host_http_conn_pool_map_;
+    std::unordered_map<HostConstSharedPtr, ConnPoolsContainer> host_http_conn_pool_map_;
     const HostSet* local_host_set_{};
   };
 
@@ -141,11 +199,12 @@ private:
     ClusterPtr cluster_;
   };
 
+  static ClusterManagerStats generateStats(Stats::Scope& scope);
   void loadCluster(const Json::Object& cluster, bool added_via_api);
   void postInitializeCluster(Cluster& cluster);
   void postThreadLocalClusterUpdate(const Cluster& primary_cluster,
-                                    const std::vector<HostPtr>& hosts_added,
-                                    const std::vector<HostPtr>& hosts_removed);
+                                    const std::vector<HostSharedPtr>& hosts_added,
+                                    const std::vector<HostSharedPtr>& hosts_removed);
 
   ClusterManagerFactory& factory_;
   Runtime::Loader& runtime_;
@@ -154,12 +213,12 @@ private:
   Runtime::RandomGenerator& random_;
   uint32_t thread_local_slot_;
   std::unordered_map<std::string, PrimaryClusterData> primary_clusters_;
-  std::function<void()> initialized_callback_;
-  uint32_t pending_cluster_init_;
   Optional<SdsConfig> sds_config_;
-  std::list<Cluster*> secondary_init_clusters_;
-  Outlier::EventLoggerPtr outlier_event_logger_;
+  Outlier::EventLoggerSharedPtr outlier_event_logger_;
   const LocalInfo::LocalInfo& local_info_;
+  CdsApiPtr cds_api_;
+  ClusterManagerStats cm_stats_;
+  ClusterManagerInitHelper init_helper_;
 };
 
 } // Upstream

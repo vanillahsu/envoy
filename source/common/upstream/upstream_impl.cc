@@ -1,7 +1,4 @@
-#include "health_checker_impl.h"
-#include "logical_dns_cluster.h"
-#include "sds.h"
-#include "upstream_impl.h"
+#include "common/upstream/upstream_impl.h"
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
@@ -12,28 +9,32 @@
 #include "common/common/enum_to_int.h"
 #include "common/common/utility.h"
 #include "common/http/utility.h"
+#include "common/json/config_schemas.h"
 #include "common/json/json_loader.h"
+#include "common/network/address_impl.h"
 #include "common/network/utility.h"
 #include "common/ssl/connection_impl.h"
 #include "common/ssl/context_config_impl.h"
+#include "common/upstream/health_checker_impl.h"
+#include "common/upstream/logical_dns_cluster.h"
+#include "common/upstream/sds.h"
 
 namespace Upstream {
 
 Outlier::DetectorHostSinkNullImpl HostDescriptionImpl::null_outlier_detector_;
 
 Host::CreateConnectionData HostImpl::createConnection(Event::Dispatcher& dispatcher) const {
-  return {createConnection(dispatcher, *cluster_, url_), shared_from_this()};
+  return {createConnection(dispatcher, *cluster_, address_), shared_from_this()};
 }
 
-Network::ClientConnectionPtr HostImpl::createConnection(Event::Dispatcher& dispatcher,
-                                                        const ClusterInfo& cluster,
-                                                        const std::string& url) {
-  if (cluster.sslContext()) {
-    return Network::ClientConnectionPtr{
-        dispatcher.createSslClientConnection(*cluster.sslContext(), url)};
-  } else {
-    return Network::ClientConnectionPtr{dispatcher.createClientConnection(url)};
-  }
+Network::ClientConnectionPtr
+HostImpl::createConnection(Event::Dispatcher& dispatcher, const ClusterInfo& cluster,
+                           Network::Address::InstanceConstSharedPtr address) {
+  Network::ClientConnectionPtr connection =
+      cluster.sslContext() ? dispatcher.createSslClientConnection(*cluster.sslContext(), address)
+                           : dispatcher.createClientConnection(address);
+  connection->setReadBufferLimit(cluster.perConnectionBufferLimitBytes());
+  return connection;
 }
 
 void HostImpl::weight(uint32_t new_weight) { weight_ = std::max(1U, std::min(100U, new_weight)); }
@@ -46,8 +47,8 @@ ClusterStats ClusterInfoImpl::generateStats(Stats::Scope& scope) {
   return {ALL_CLUSTER_STATS(POOL_COUNTER(scope), POOL_GAUGE(scope), POOL_TIMER(scope))};
 }
 
-void HostSetImpl::runUpdateCallbacks(const std::vector<HostPtr>& hosts_added,
-                                     const std::vector<HostPtr>& hosts_removed) {
+void HostSetImpl::runUpdateCallbacks(const std::vector<HostSharedPtr>& hosts_added,
+                                     const std::vector<HostSharedPtr>& hosts_removed) {
   for (MemberUpdateCb& callback : callbacks_) {
     callback(hosts_added, hosts_removed);
   }
@@ -58,8 +59,10 @@ ClusterInfoImpl::ClusterInfoImpl(const Json::Object& config, Runtime::Loader& ru
     : runtime_(runtime), name_(config.getString("name")),
       max_requests_per_connection_(config.getInteger("max_requests_per_connection", 0)),
       connect_timeout_(std::chrono::milliseconds(config.getInteger("connect_timeout_ms"))),
-      stats_scope_(stats, fmt::format("cluster.{}.", name_)), stats_(generateStats(stats_scope_)),
-      features_(parseFeatures(config)),
+      per_connection_buffer_limit_bytes_(
+          config.getInteger("per_connection_buffer_limit_bytes", 1024 * 1024)),
+      stats_scope_(stats.createScope(fmt::format("cluster.{}.", name_))),
+      stats_(generateStats(*stats_scope_)), features_(parseFeatures(config)),
       http_codec_options_(Http::Utility::parseCodecOptions(config)),
       resource_managers_(config, runtime, name_),
       maintenance_mode_runtime_key_(fmt::format("upstream.maintenance_mode.{}", name_)) {
@@ -67,7 +70,7 @@ ClusterInfoImpl::ClusterInfoImpl(const Json::Object& config, Runtime::Loader& ru
   ssl_ctx_ = nullptr;
   if (config.hasObject("ssl_context")) {
     Ssl::ContextConfigImpl context_config(*config.getObject("ssl_context"));
-    ssl_ctx_ = ssl_context_manager.createSslClientContext(stats_scope_, context_config);
+    ssl_ctx_ = ssl_context_manager.createSslClientContext(*stats_scope_, context_config);
   }
 
   std::string string_lb_type = config.getString("lb_type");
@@ -77,12 +80,15 @@ ClusterInfoImpl::ClusterInfoImpl(const Json::Object& config, Runtime::Loader& ru
     lb_type_ = LoadBalancerType::LeastRequest;
   } else if (string_lb_type == "random") {
     lb_type_ = LoadBalancerType::Random;
+  } else if (string_lb_type == "ring_hash") {
+    lb_type_ = LoadBalancerType::RingHash;
   } else {
     throw EnvoyException(fmt::format("cluster: unknown LB type '{}'", string_lb_type));
   }
 }
 
-const ConstHostListsPtr ClusterImplBase::empty_host_lists_{new std::vector<std::vector<HostPtr>>()};
+const HostListsConstSharedPtr ClusterImplBase::empty_host_lists_{
+    new std::vector<std::vector<HostSharedPtr>>()};
 
 ClusterPtr ClusterImplBase::create(const Json::Object& cluster, ClusterManager& cm,
                                    Stats::Store& stats, ThreadLocal::Instance& tls,
@@ -92,7 +98,10 @@ ClusterPtr ClusterImplBase::create(const Json::Object& cluster, ClusterManager& 
                                    Event::Dispatcher& dispatcher,
                                    const Optional<SdsConfig>& sds_config,
                                    const LocalInfo::LocalInfo& local_info,
-                                   Outlier::EventLoggerPtr outlier_event_logger) {
+                                   Outlier::EventLoggerSharedPtr outlier_event_logger) {
+
+  cluster.validateSchema(Json::Schema::CLUSTER_SCHEMA);
+
   std::unique_ptr<ClusterImplBase> new_cluster;
   std::string string_type = cluster.getString("type");
   if (string_type == "static") {
@@ -137,8 +146,9 @@ ClusterImplBase::ClusterImplBase(const Json::Object& config, Runtime::Loader& ru
                                  Stats::Store& stats, Ssl::ContextManager& ssl_context_manager)
     : runtime_(runtime), info_(new ClusterInfoImpl(config, runtime, stats, ssl_context_manager)) {}
 
-ConstHostVectorPtr ClusterImplBase::createHealthyHostList(const std::vector<HostPtr>& hosts) {
-  HostVectorPtr healthy_list(new std::vector<HostPtr>());
+HostVectorConstSharedPtr
+ClusterImplBase::createHealthyHostList(const std::vector<HostSharedPtr>& hosts) {
+  HostVectorSharedPtr healthy_list(new std::vector<HostSharedPtr>());
   for (const auto& host : hosts) {
     if (host->healthy()) {
       healthy_list->emplace_back(host);
@@ -148,12 +158,12 @@ ConstHostVectorPtr ClusterImplBase::createHealthyHostList(const std::vector<Host
   return healthy_list;
 }
 
-ConstHostListsPtr
-ClusterImplBase::createHealthyHostLists(const std::vector<std::vector<HostPtr>>& hosts) {
-  HostListsPtr healthy_list(new std::vector<std::vector<HostPtr>>());
+HostListsConstSharedPtr
+ClusterImplBase::createHealthyHostLists(const std::vector<std::vector<HostSharedPtr>>& hosts) {
+  HostListsSharedPtr healthy_list(new std::vector<std::vector<HostSharedPtr>>());
 
   for (const auto& hosts_zone : hosts) {
-    std::vector<HostPtr> current_zone_hosts;
+    std::vector<HostSharedPtr> current_zone_hosts;
     for (const auto& host : hosts_zone) {
       if (host->healthy()) {
         current_zone_hosts.emplace_back(host);
@@ -187,8 +197,8 @@ ResourceManager& ClusterInfoImpl::resourceManager(ResourcePriority priority) con
   return *resource_managers_.managers_[enumToInt(priority)];
 }
 
-void ClusterImplBase::runUpdateCallbacks(const std::vector<HostPtr>& hosts_added,
-                                         const std::vector<HostPtr>& hosts_removed) {
+void ClusterImplBase::runUpdateCallbacks(const std::vector<HostSharedPtr>& hosts_added,
+                                         const std::vector<HostSharedPtr>& hosts_removed) {
   if (!hosts_added.empty() || !hosts_removed.empty()) {
     info_->stats().membership_change_.inc();
   }
@@ -202,7 +212,7 @@ void ClusterImplBase::setHealthChecker(HealthCheckerPtr&& health_checker) {
   ASSERT(!health_checker_);
   health_checker_ = std::move(health_checker);
   health_checker_->start();
-  health_checker_->addHostCheckCompleteCb([this](HostPtr, bool changed_state) -> void {
+  health_checker_->addHostCheckCompleteCb([this](HostSharedPtr, bool changed_state) -> void {
     // If we get a health check completion that resulted in a state change, signal to
     // update the host sets on all threads.
     if (changed_state) {
@@ -211,18 +221,19 @@ void ClusterImplBase::setHealthChecker(HealthCheckerPtr&& health_checker) {
   });
 }
 
-void ClusterImplBase::setOutlierDetector(Outlier::DetectorPtr outlier_detector) {
+void ClusterImplBase::setOutlierDetector(Outlier::DetectorSharedPtr outlier_detector) {
   if (!outlier_detector) {
     return;
   }
 
   outlier_detector_ = std::move(outlier_detector);
-  outlier_detector_->addChangedStateCb([this](HostPtr) -> void { reloadHealthyHosts(); });
+  outlier_detector_->addChangedStateCb([this](HostSharedPtr) -> void { reloadHealthyHosts(); });
 }
 
 void ClusterImplBase::reloadHealthyHosts() {
-  ConstHostVectorPtr hosts_copy(new std::vector<HostPtr>(hosts()));
-  ConstHostListsPtr hosts_per_zone_copy(new std::vector<std::vector<HostPtr>>(hostsPerZone()));
+  HostVectorConstSharedPtr hosts_copy(new std::vector<HostSharedPtr>(hosts()));
+  HostListsConstSharedPtr hosts_per_zone_copy(
+      new std::vector<std::vector<HostSharedPtr>>(hostsPerZone()));
   updateHosts(hosts_copy, createHealthyHostList(hosts()), hosts_per_zone_copy,
               createHealthyHostLists(hostsPerZone()), {}, {});
 }
@@ -258,35 +269,41 @@ StaticClusterImpl::StaticClusterImpl(const Json::Object& config, Runtime::Loader
                                      Stats::Store& stats, Ssl::ContextManager& ssl_context_manager)
     : ClusterImplBase(config, runtime, stats, ssl_context_manager) {
   std::vector<Json::ObjectPtr> hosts_json = config.getObjectArray("hosts");
-  HostVectorPtr new_hosts(new std::vector<HostPtr>());
+  HostVectorSharedPtr new_hosts(new std::vector<HostSharedPtr>());
   for (Json::ObjectPtr& host : hosts_json) {
-    std::string url = host->getString("url");
-    // resolve the URL to make sure it's valid
-    Network::Utility::resolve(url);
-    new_hosts->emplace_back(HostPtr{new HostImpl(info_, url, false, 1, "")});
+    new_hosts->emplace_back(HostSharedPtr{new HostImpl(
+        info_, "", Network::Utility::resolveUrl(host->getString("url")), false, 1, "")});
   }
 
   updateHosts(new_hosts, createHealthyHostList(*new_hosts), empty_host_lists_, empty_host_lists_,
               {}, {});
 }
 
-bool BaseDynamicClusterImpl::updateDynamicHostList(const std::vector<HostPtr>& new_hosts,
-                                                   std::vector<HostPtr>& current_hosts,
-                                                   std::vector<HostPtr>& hosts_added,
-                                                   std::vector<HostPtr>& hosts_removed,
+bool BaseDynamicClusterImpl::updateDynamicHostList(const std::vector<HostSharedPtr>& new_hosts,
+                                                   std::vector<HostSharedPtr>& current_hosts,
+                                                   std::vector<HostSharedPtr>& hosts_added,
+                                                   std::vector<HostSharedPtr>& hosts_removed,
                                                    bool depend_on_hc) {
   uint64_t max_host_weight = 1;
 
   // Go through and see if the list we have is different from what we just got. If it is, we
   // make a new host list and raise a change notification. This uses an N^2 search given that
-  // this does not happen very often and the list sizes should be small.
-  std::vector<HostPtr> final_hosts;
-  for (HostPtr host : new_hosts) {
+  // this does not happen very often and the list sizes should be small. We also check for
+  // duplicates here. It's possible for DNS to return the same address multiple times, and a bad
+  // SDS implementation could do the same thing.
+  std::unordered_set<std::string> host_addresses;
+  std::vector<HostSharedPtr> final_hosts;
+  for (HostSharedPtr host : new_hosts) {
+    if (host_addresses.count(host->address()->asString())) {
+      continue;
+    }
+    host_addresses.emplace(host->address()->asString());
+
     bool found = false;
     for (auto i = current_hosts.begin(); i != current_hosts.end();) {
-      // If we find a host matched based on URL, we keep it. However we do change weight inline so
-      // do that here.
-      if ((*i)->url() == host->url()) {
+      // If we find a host matched based on address, we keep it. However we do change weight inline
+      // so do that here.
+      if (*(*i)->address() == *host->address()) {
         if (host->weight() > max_host_weight) {
           max_host_weight = host->weight();
         }
@@ -356,14 +373,20 @@ StrictDnsClusterImpl::StrictDnsClusterImpl(const Json::Object& config, Runtime::
   for (Json::ObjectPtr& host : config.getObjectArray("hosts")) {
     resolve_targets_.emplace_back(new ResolveTarget(*this, dispatcher, host->getString("url")));
   }
+  // We have to first construct resolve_targets_ before invoking startResolve(),
+  // since startResolve() might resolve immediately and relies on
+  // resolve_targets_ indirectly for performing host updates on resolution.
+  for (const ResolveTargetPtr& target : resolve_targets_) {
+    target->startResolve();
+  }
 }
 
-void StrictDnsClusterImpl::updateAllHosts(const std::vector<HostPtr>& hosts_added,
-                                          const std::vector<HostPtr>& hosts_removed) {
+void StrictDnsClusterImpl::updateAllHosts(const std::vector<HostSharedPtr>& hosts_added,
+                                          const std::vector<HostSharedPtr>& hosts_removed) {
   // At this point we know that we are different so make a new host list and notify.
-  HostVectorPtr new_hosts(new std::vector<HostPtr>());
+  HostVectorSharedPtr new_hosts(new std::vector<HostSharedPtr>());
   for (const ResolveTargetPtr& target : resolve_targets_) {
-    for (const HostPtr& host : target->hosts_) {
+    for (const HostSharedPtr& host : target->hosts_) {
       new_hosts->emplace_back(host);
     }
   }
@@ -375,12 +398,9 @@ void StrictDnsClusterImpl::updateAllHosts(const std::vector<HostPtr>& hosts_adde
 StrictDnsClusterImpl::ResolveTarget::ResolveTarget(StrictDnsClusterImpl& parent,
                                                    Event::Dispatcher& dispatcher,
                                                    const std::string& url)
-    : parent_(parent), dns_address_(Network::Utility::hostFromUrl(url)),
-      port_(Network::Utility::portFromUrl(url)),
-      resolve_timer_(dispatcher.createTimer([this]() -> void { startResolve(); })) {
-
-  startResolve();
-}
+    : parent_(parent), dns_address_(Network::Utility::hostFromTcpUrl(url)),
+      port_(Network::Utility::portFromTcpUrl(url)),
+      resolve_timer_(dispatcher.createTimer([this]() -> void { startResolve(); })) {}
 
 StrictDnsClusterImpl::ResolveTarget::~ResolveTarget() {
   if (active_query_) {
@@ -392,20 +412,27 @@ void StrictDnsClusterImpl::ResolveTarget::startResolve() {
   log_debug("starting async DNS resolution for {}", dns_address_);
   parent_.info_->stats().update_attempt_.inc();
 
-  active_query_ = &parent_.dns_resolver_.resolve(
-      dns_address_, [this](std::list<std::string>&& address_list) -> void {
+  active_query_ = parent_.dns_resolver_.resolve(
+      dns_address_,
+      [this](std::list<Network::Address::InstanceConstSharedPtr>&& address_list) -> void {
         active_query_ = nullptr;
         log_debug("async DNS resolution complete for {}", dns_address_);
         parent_.info_->stats().update_success_.inc();
 
-        std::vector<HostPtr> new_hosts;
-        for (const std::string& address : address_list) {
+        std::vector<HostSharedPtr> new_hosts;
+        for (Network::Address::InstanceConstSharedPtr address : address_list) {
+          // TODO(mattklein123): Currently the DNS interface does not consider port. We need to make
+          // a new address that has port in it. We need to both support IPv6 as well as potentially
+          // move port handling into the DNS interface itself, which would work better for SRV.
           new_hosts.emplace_back(new HostImpl(
-              parent_.info_, Network::Utility::urlForTcp(address, port_), false, 1, ""));
+              parent_.info_, dns_address_,
+              Network::Address::InstanceConstSharedPtr{
+                  new Network::Address::Ipv4Instance(address->ip()->addressAsString(), port_)},
+              false, 1, ""));
         }
 
-        std::vector<HostPtr> hosts_added;
-        std::vector<HostPtr> hosts_removed;
+        std::vector<HostSharedPtr> hosts_added;
+        std::vector<HostSharedPtr> hosts_removed;
         if (parent_.updateDynamicHostList(new_hosts, hosts_, hosts_added, hosts_removed, false)) {
           log_debug("DNS hosts have changed for {}", dns_address_);
           parent_.updateAllHosts(hosts_added, hosts_removed);
@@ -419,20 +446,10 @@ void StrictDnsClusterImpl::ResolveTarget::startResolve() {
           parent_.initialize_callback_();
           parent_.initialize_callback_ = nullptr;
         }
+        parent_.initialized_ = true;
 
         resolve_timer_->enableTimer(parent_.dns_refresh_rate_ms_);
       });
-}
-
-void HostDescriptionImpl::checkUrl() {
-  if (url_.find(Network::Utility::TCP_SCHEME) == 0) {
-    Network::Utility::hostFromUrl(url_);
-    Network::Utility::portFromUrl(url_);
-  } else if (url_.find(Network::Utility::UNIX_SCHEME) == 0) {
-    Network::Utility::pathFromUrl(url_);
-  } else {
-    throw EnvoyException(fmt::format("malformed url: {}", url_));
-  }
 }
 
 } // Upstream

@@ -1,8 +1,5 @@
 #pragma once
 
-#include "connection_handler_impl.h"
-#include "worker.h"
-
 #include "envoy/common/optional.h"
 #include "envoy/server/drain_manager.h"
 #include "envoy/server/instance.h"
@@ -14,8 +11,10 @@
 #include "common/runtime/runtime_impl.h"
 #include "common/ssl/context_manager_impl.h"
 #include "common/thread_local/thread_local_impl.h"
+#include "server/connection_handler_impl.h"
 #include "server/http/admin.h"
 #include "server/test_hooks.h"
+#include "server/worker.h"
 
 namespace Server {
 
@@ -69,14 +68,31 @@ public:
 };
 
 /**
+ * Implementation of Init::Manager for use during post cluster manager init / pre listening.
+ */
+class InitManagerImpl : public Init::Manager {
+public:
+  void initialize(std::function<void()> callback);
+
+  // Init::Manager
+  void registerTarget(Init::Target& target) override;
+
+private:
+  enum class State { NotInitialized, Initializing, Initialized };
+
+  std::list<Init::Target*> targets_;
+  State state_{State::NotInitialized};
+  std::function<void()> callback_;
+};
+
+/**
  * This is the actual full standalone server which stiches together various common components.
  */
 class InstanceImpl : Logger::Loggable<Logger::Id::main>, public Instance {
 public:
-  InstanceImpl(Options& options, TestHooks& hooks, HotRestart& restarter, Stats::Store& store,
+  InstanceImpl(Options& options, TestHooks& hooks, HotRestart& restarter, Stats::StoreRoot& store,
                Thread::BasicLockable& access_log_lock, ComponentFactory& component_factory,
                const LocalInfo::LocalInfo& local_info);
-  ~InstanceImpl();
 
   void run();
 
@@ -92,9 +108,11 @@ public:
   DrainManager& drainManager() override { return *drain_manager_; }
   AccessLog::AccessLogManager& accessLogManager() override { return access_log_manager_; }
   void failHealthcheck(bool fail) override;
-  int getListenSocketFd(uint32_t port) override;
+  int getListenSocketFd(const std::string& address) override;
+  Network::ListenSocket* getListenSocketByIndex(uint32_t index) override;
   void getParentStats(HotRestart::GetParentStatsInfo& info) override;
   HotRestart& hotRestart() override { return restarter_; }
+  Init::Manager& initManager() override { return init_manager_; }
   Runtime::RandomGenerator& random() override { return random_generator_; }
   RateLimit::ClientPtr
   rateLimitClient(const Optional<std::chrono::milliseconds>& timeout) override {
@@ -118,12 +136,13 @@ private:
   void initializeStatSinks();
   void loadServerFlags(const Optional<std::string>& flags_path);
   uint64_t numConnections();
+  void startWorkers(TestHooks& hooks);
 
   Options& options_;
   HotRestart& restarter_;
   const time_t start_time_;
   time_t original_start_time_;
-  Stats::Store& stats_store_;
+  Stats::StoreRoot& stats_store_;
   std::list<Stats::SinkPtr> stat_sinks_;
   ServerStats server_stats_;
   ThreadLocal::InstanceImpl thread_local_;
@@ -134,6 +153,7 @@ private:
   std::unique_ptr<Ssl::ContextManagerImpl> ssl_context_manager_;
   std::unique_ptr<Configuration::Main> config_;
   std::list<WorkerPtr> workers_;
+  Stats::ScopePtr admin_scope_;
   std::unique_ptr<AdminImpl> admin_;
   Event::SignalEventPtr sigterm_;
   Event::SignalEventPtr sig_usr_1_;
@@ -143,6 +163,8 @@ private:
   const LocalInfo::LocalInfo& local_info_;
   DrainManagerPtr drain_manager_;
   AccessLog::AccessLogManagerImpl access_log_manager_;
+  InitManagerImpl init_manager_;
+  std::unique_ptr<Server::GuardDog> guard_dog_;
 };
 
 } // Server

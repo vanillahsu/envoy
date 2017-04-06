@@ -11,13 +11,12 @@
 namespace Redis {
 namespace ConnPool {
 
-// TODO: Stats
-// TODO: Connect timeout
-// TODO: Op timeout
+// TODO(mattklein123): Op timeout
+// TODO(mattklein123): Circuit breaking
 
 class ClientImpl : public Client, public DecoderCallbacks, public Network::ConnectionCallbacks {
 public:
-  static ClientPtr create(const std::string& cluster_name, Upstream::ClusterManager& cm,
+  static ClientPtr create(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher,
                           EncoderPtr&& encoder, DecoderFactory& decoder_factory);
 
   ~ClientImpl();
@@ -27,7 +26,7 @@ public:
     connection_->addConnectionCallbacks(callbacks);
   }
   void close() override;
-  ActiveRequest* makeRequest(const RespValue& request, ActiveRequestCallbacks& callbacks) override;
+  PoolRequest* makeRequest(const RespValue& request, PoolCallbacks& callbacks) override;
 
 private:
   struct UpstreamReadFilter : public Network::ReadFilterBaseImpl {
@@ -42,19 +41,21 @@ private:
     ClientImpl& parent_;
   };
 
-  struct PendingRequest : public ActiveRequest {
-    PendingRequest(ActiveRequestCallbacks& callbacks) : callbacks_(callbacks) {}
+  struct PendingRequest : public PoolRequest {
+    PendingRequest(ClientImpl& parent, PoolCallbacks& callbacks);
+    ~PendingRequest();
 
-    // Redis::ConnPool::ActiveRequest
+    // Redis::ConnPool::PoolRequest
     void cancel() override;
 
-    ActiveRequestCallbacks& callbacks_;
+    ClientImpl& parent_;
+    PoolCallbacks& callbacks_;
     bool canceled_{};
   };
 
-  ClientImpl(EncoderPtr&& encoder, DecoderFactory& decoder_factory)
-      : encoder_(std::move(encoder)), decoder_(decoder_factory.create(*this)) {}
-
+  ClientImpl(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher, EncoderPtr&& encoder,
+             DecoderFactory& decoder_factory);
+  void onConnectTimeout();
   void onData(Buffer::Instance& data);
 
   // Redis::DecoderCallbacks
@@ -63,17 +64,19 @@ private:
   // Network::ConnectionCallbacks
   void onEvent(uint32_t events) override;
 
+  Upstream::HostConstSharedPtr host_;
   Network::ClientConnectionPtr connection_;
   EncoderPtr encoder_;
   Buffer::OwnedImpl encoder_buffer_;
   DecoderPtr decoder_;
   std::list<PendingRequest> pending_requests_;
+  Event::TimerPtr connect_timer_;
 };
 
 class ClientFactoryImpl : public ClientFactory {
 public:
   // Redis::ConnPool::ClientFactoryImpl
-  ClientPtr create(const std::string& cluster_name, Upstream::ClusterManager& cm) override;
+  ClientPtr create(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher) override;
 
   static ClientFactoryImpl instance_;
 
@@ -81,16 +84,14 @@ private:
   DecoderFactoryImpl decoder_factory_;
 };
 
-// TODO: Real hashing connection pool with N connections per upstream.
-
 class InstanceImpl : public Instance {
 public:
   InstanceImpl(const std::string& cluster_name, Upstream::ClusterManager& cm,
                ClientFactory& client_factory, ThreadLocal::Instance& tls);
 
   // Redis::ConnPool::Instance
-  ActiveRequest* makeRequest(const std::string& hash_key, const RespValue& request,
-                             ActiveRequestCallbacks& callbacks) override;
+  PoolRequest* makeRequest(const std::string& hash_key, const RespValue& request,
+                           PoolCallbacks& callbacks) override;
 
 private:
   struct ThreadLocalPool;
@@ -100,30 +101,41 @@ private:
     ThreadLocalActiveClient(ThreadLocalPool& parent) : parent_(parent) {}
 
     // Network::ConnectionCallbacks
-    void onEvent(uint32_t events) override { parent_.onEvent(*this, events); }
+    void onEvent(uint32_t events) override;
 
     ThreadLocalPool& parent_;
+    Upstream::HostConstSharedPtr host_;
     ClientPtr redis_client_;
   };
 
   typedef std::unique_ptr<ThreadLocalActiveClient> ThreadLocalActiveClientPtr;
 
   struct ThreadLocalPool : public ThreadLocal::ThreadLocalObject {
-    ThreadLocalPool(InstanceImpl& parent, Event::Dispatcher& dispatcher)
-        : parent_(parent), dispatcher_(dispatcher) {}
+    ThreadLocalPool(InstanceImpl& parent, Event::Dispatcher& dispatcher,
+                    const std::string& cluster_name);
 
-    ActiveRequest* makeRequest(const RespValue& request, ActiveRequestCallbacks& callbacks);
-    void onEvent(ThreadLocalActiveClient& client, uint32_t events);
+    PoolRequest* makeRequest(const std::string& hash_key, const RespValue& request,
+                             PoolCallbacks& callbacks);
+    void onHostsRemoved(const std::vector<Upstream::HostSharedPtr>& hosts_removed);
 
     // ThreadLocal::ThreadLocalObject
     void shutdown() override;
 
     InstanceImpl& parent_;
     Event::Dispatcher& dispatcher_;
-    ThreadLocalActiveClientPtr client_;
+    Upstream::ThreadLocalCluster* cluster_;
+    std::unordered_map<Upstream::HostConstSharedPtr, ThreadLocalActiveClientPtr> client_map_;
   };
 
-  const std::string cluster_name_;
+  struct LbContextImpl : public Upstream::LoadBalancerContext {
+    LbContextImpl(const std::string& hash_key) : hash_key_(std::hash<std::string>()(hash_key)) {}
+
+    // Upstream::LoadBalancerContext
+    const Optional<uint64_t>& hashKey() const override { return hash_key_; }
+
+    const Optional<uint64_t> hash_key_;
+  };
+
   Upstream::ClusterManager& cm_;
   ClientFactory& client_factory_;
   ThreadLocal::Instance& tls_;

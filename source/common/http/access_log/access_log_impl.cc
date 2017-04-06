@@ -1,5 +1,4 @@
-#include "access_log_impl.h"
-#include "access_log_formatter.h"
+#include "common/http/access_log/access_log_impl.h"
 
 #include "envoy/filesystem/filesystem.h"
 #include "envoy/http/header_map.h"
@@ -8,6 +7,7 @@
 
 #include "common/common/assert.h"
 #include "common/common/utility.h"
+#include "common/http/access_log/access_log_formatter.h"
 #include "common/http/headers.h"
 #include "common/http/header_map_impl.h"
 #include "common/http/utility.h"
@@ -66,13 +66,11 @@ FilterPtr FilterImpl::fromJson(Json::Object& json, Runtime::Loader& runtime) {
   } else if (type == "not_healthcheck") {
     return FilterPtr{new NotHealthCheckFilter()};
   } else if (type == "traceable_request") {
-    return FilterPtr{new TraceableRequestFilter(runtime)};
+    return FilterPtr{new TraceableRequestFilter()};
   } else {
     throw EnvoyException(fmt::format("invalid access log filter type '{}'", type));
   }
 }
-
-TraceableRequestFilter::TraceableRequestFilter(Runtime::Loader& runtime) : runtime_(runtime) {}
 
 bool TraceableRequestFilter::evaluate(const RequestInfo& info, const HeaderMap& request_headers) {
   Tracing::Decision decision = Tracing::HttpTracerUtility::isTracing(info, request_headers);
@@ -99,7 +97,8 @@ bool RuntimeFilter::evaluate(const RequestInfo&, const HeaderMap& request_header
   const HeaderEntry* uuid = request_header.RequestId();
   uint16_t sampled_value;
   if (uuid && UuidUtils::uuidModBy(uuid->value().c_str(), sampled_value, 100)) {
-    uint64_t runtime_value = std::min(runtime_.snapshot().getInteger(runtime_key_, 0), 100UL);
+    uint64_t runtime_value =
+        std::min<uint64_t>(runtime_.snapshot().getInteger(runtime_key_, 0), 100);
 
     return sampled_value < static_cast<uint16_t>(runtime_value);
   } else {
@@ -165,8 +164,8 @@ InstanceImpl::InstanceImpl(const std::string& access_log_path, FilterPtr&& filte
   log_file_ = log_manager.createAccessLog(access_log_path);
 }
 
-InstancePtr InstanceImpl::fromJson(Json::Object& json, Runtime::Loader& runtime,
-                                   ::AccessLog::AccessLogManager& log_manager) {
+InstanceSharedPtr InstanceImpl::fromJson(Json::Object& json, Runtime::Loader& runtime,
+                                         ::AccessLog::AccessLogManager& log_manager) {
   std::string access_log_path = json.getString("path");
 
   FilterPtr filter;
@@ -182,7 +181,7 @@ InstancePtr InstanceImpl::fromJson(Json::Object& json, Runtime::Loader& runtime,
     formatter = AccessLogFormatUtils::defaultAccessLogFormatter();
   }
 
-  return InstancePtr{
+  return InstanceSharedPtr{
       new InstanceImpl(access_log_path, std::move(filter), std::move(formatter), log_manager)};
 }
 
